@@ -18,6 +18,8 @@ from sklearn.preprocessing import StandardScaler
 
 LAG_STEPS = [1, 2, 24, 48, 168]
 ROLL_WINDOWS = [24, 48, 168]
+EXOG_LAG_STEPS = [1, 2, 6, 24, 48, 168]
+EXOG_ROLL_WINDOWS = [6, 24, 72]
 
 
 class _Tee:
@@ -196,12 +198,14 @@ def add_residual_load_features(train_df: pd.DataFrame, test_df: pd.DataFrame) ->
     if not required.issubset(train_res.columns) or not required.issubset(test_res.columns):
         return train_res, test_res
 
-    train_res["residual_load"] = (
+    train_res["net_load"] = (
         train_res[demand_col].astype(float) - train_res["wind_forecast"].astype(float) - train_res["solar_forecast"].astype(float)
     )
-    test_res["residual_load"] = (
+    test_res["net_load"] = (
         test_res[demand_col].astype(float) - test_res["wind_forecast"].astype(float) - test_res["solar_forecast"].astype(float)
     )
+    train_res["residual_load"] = train_res["net_load"]
+    test_res["residual_load"] = test_res["net_load"]
 
     train_res = train_res.sort_values(["market", "delivery_start_ts", "id"]).reset_index(drop=True)
     test_res = test_res.sort_values(["market", "delivery_start_ts", "id"]).reset_index(drop=True)
@@ -305,6 +309,68 @@ def add_train_lag_features(df: pd.DataFrame) -> pd.DataFrame:
         result["load_forecast_delta_24"] = result["load_forecast"] - lf_lag_24
 
     return result.sort_values(["delivery_start_ts", "market", "id"]).reset_index(drop=True)
+
+
+def add_exogenous_lag_block(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    enabled_markets: set[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    train_aug = train_df.copy()
+    test_aug = test_df.copy()
+
+    candidate_cols = [
+        "demand_forecast",
+        "load_forecast",
+        "wind_forecast",
+        "solar_forecast",
+        "net_load",
+    ]
+    exog_cols = [col for col in candidate_cols if col in train_aug.columns and col in test_aug.columns]
+    if not exog_cols:
+        return train_aug, test_aug
+
+    comb_train = train_aug.copy()
+    comb_test = test_aug.copy()
+    comb_train["__is_train"] = 1
+    comb_test["__is_train"] = 0
+    combined = pd.concat([comb_train, comb_test], ignore_index=True, sort=False)
+    combined = combined.sort_values(["market", "delivery_start_ts", "id"]).reset_index(drop=True)
+    grouped = combined.groupby("market", sort=False)
+
+    enabled_mask = np.ones(len(combined), dtype=bool)
+    if enabled_markets is not None:
+        enabled_mask = combined["market"].astype(str).isin(sorted(enabled_markets)).to_numpy()
+    combined["exog_lag_enabled"] = enabled_mask.astype(int)
+
+    for col in exog_cols:
+        series = combined[col].astype(float)
+        shifted = grouped[col].shift(1)
+
+        for lag in EXOG_LAG_STEPS:
+            lag_col = f"{col}_lag_{lag}"
+            ramp_col = f"{col}_ramp_{lag}"
+            combined[lag_col] = grouped[col].shift(lag)
+            combined[ramp_col] = series - combined[lag_col]
+            if enabled_markets is not None:
+                combined.loc[~enabled_mask, lag_col] = 0.0
+                combined.loc[~enabled_mask, ramp_col] = 0.0
+
+        for window in EXOG_ROLL_WINDOWS:
+            roll_mean_col = f"{col}_roll_mean_{window}"
+            roll_std_col = f"{col}_roll_std_{window}"
+            rolling_grouped = shifted.groupby(combined["market"]).rolling(window, min_periods=4)
+            combined[roll_mean_col] = rolling_grouped.mean().reset_index(level=0, drop=True)
+            combined[roll_std_col] = rolling_grouped.std().reset_index(level=0, drop=True)
+            if enabled_markets is not None:
+                combined.loc[~enabled_mask, roll_mean_col] = 0.0
+                combined.loc[~enabled_mask, roll_std_col] = 0.0
+
+    train_out = combined.loc[combined["__is_train"] == 1].drop(columns=["__is_train"]).copy()
+    test_out = combined.loc[combined["__is_train"] == 0].drop(columns=["__is_train"]).copy()
+    train_out = train_out.sort_values(["delivery_start_ts", "market", "id"]).reset_index(drop=True)
+    test_out = test_out.sort_values(["delivery_start_ts", "market", "id"]).reset_index(drop=True)
+    return train_out, test_out
 
 
 def add_test_base_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -696,15 +762,18 @@ def _hybrid_predict_market(
     direct_num_fill_values: dict[str, float],
     history_targets: list[float],
     recursive_models: dict[str, object],
-    direct_models: dict[str, object],
+    direct_mid_models: dict[str, object],
+    direct_long_models: dict[str, object],
     stacker,
     baseline_model: dict[str, object],
     recursive_steps: int,
+    mid_horizon_steps: int,
 ) -> pd.Series:
     preds: list[float] = []
 
     for step_idx, idx in enumerate(test_market_df.index):
         use_recursive = step_idx < recursive_steps
+        use_mid_horizon = recursive_steps <= step_idx < (recursive_steps + mid_horizon_steps)
 
         if not use_recursive:
             row_direct = test_market_df.loc[idx, direct_feature_cols].copy()
@@ -721,7 +790,7 @@ def _hybrid_predict_market(
             components = _predict_model_components(
                 row_df=row_df_direct,
                 numeric_cols=direct_numeric_cols,
-                models=direct_models,
+                models=direct_mid_models if use_mid_horizon else direct_long_models,
             )
             baseline_pred = float(_predict_baseline(baseline_model, row_df_direct)[0])
             residual_pred = _stack_residual_prediction(
@@ -779,9 +848,12 @@ def _build_default_config(config_name: str) -> dict:
         "config_name": config_name,
         "fast_dev": False,
         "exclude_2023": False,
+        "exclude_2023_keep_from_month": 10,
         "use_gpu": False,
         "gpu_devices": "0",
         "recursive_steps": 12,
+        "mid_horizon_steps": 48,
+        "mid_expert_recent_fraction": 0.45,
         "n_splits": 5,
         "purge_days": 2,
         "min_train_days": 10,
@@ -798,6 +870,7 @@ def run_with_ledger(
     lb_score: float | None,
     fast_dev: bool = False,
     exclude_2023: bool = False,
+    exclude_2023_keep_from_month: int = 10,
     use_gpu: bool = False,
     gpu_devices: str = "0",
 ) -> dict[str, str]:
@@ -842,10 +915,15 @@ def run_with_ledger(
     config = _build_default_config(safe_config_name)
     config["fast_dev"] = bool(fast_dev)
     config["exclude_2023"] = bool(exclude_2023)
+    keep_from_month = int(exclude_2023_keep_from_month)
+    keep_from_month = min(max(keep_from_month, 1), 12)
+    config["exclude_2023_keep_from_month"] = keep_from_month
     config["use_gpu"] = bool(use_gpu)
     config["gpu_devices"] = str(gpu_devices)
     if bool(config["fast_dev"]):
         config["recursive_steps"] = 6
+        config["mid_horizon_steps"] = 24
+        config["mid_expert_recent_fraction"] = 0.35
         config["n_splits"] = 3
         config["purge_days"] = 1
         config["min_train_days"] = 7
@@ -882,10 +960,17 @@ def run_with_ledger(
 
             if bool(config["exclude_2023"]):
                 train_start = pd.to_datetime(train_df["delivery_start"], errors="coerce")
-                keep_mask = train_start.dt.year != 2023
+                keep_from_month = int(config["exclude_2023_keep_from_month"])
+                keep_2023_tail = (train_start.dt.year == 2023) & (train_start.dt.month >= keep_from_month)
+                keep_mask = (train_start.dt.year != 2023) | keep_2023_tail
                 removed_count = int((~keep_mask).sum())
                 train_df = train_df.loc[keep_mask].reset_index(drop=True)
-                print(f"Excluded 2023 observations from training: removed {removed_count} rows")
+                kept_2023_count = int(keep_2023_tail.sum())
+                print(
+                    "Excluded most 2023 observations from training: "
+                    f"removed {removed_count} rows, kept {kept_2023_count} rows from "
+                    f"2023-{keep_from_month:02d} onward"
+                )
                 if train_df.empty:
                     raise ValueError("Training data is empty after excluding 2023 observations.")
 
@@ -893,6 +978,7 @@ def run_with_ledger(
             test_df = add_time_features(test_df)
 
             train_df, test_df = add_residual_load_features(train_df, test_df)
+            train_df, test_df = add_exogenous_lag_block(train_df, test_df)
 
             train_df = add_train_lag_features(train_df)
             test_df = add_test_base_features(test_df)
@@ -1008,7 +1094,12 @@ def run_with_ledger(
             print(f"Run mode: {'FAST_DEV' if bool(config['fast_dev']) else 'FULL'}")
             print(f"Using {len(feature_cols)} features total")
             print(f"Categorical ({len(cat_cols)}): {cat_cols}")
-            print(f"Inference mode: recursive first {int(config['recursive_steps'])} steps, then direct")
+            print(
+                "Inference mode: "
+                f"recursive first {int(config['recursive_steps'])} steps, "
+                f"mid-horizon expert next {int(config['mid_horizon_steps'])} steps, "
+                "then long-horizon expert"
+            )
             print("Blending mode: residual baseline + OOF stacker + global/local signal")
             print("Experts: normal + spike + peak (soft-gated)")
 
@@ -1216,14 +1307,37 @@ def run_with_ledger(
                     fast_dev=bool(config["fast_dev"]),
                 )
 
-                final_direct_models, _ = _fit_market_models(
+                recent_fraction = float(config["mid_expert_recent_fraction"])
+                recent_fraction = min(max(recent_fraction, 0.15), 0.90)
+                mid_recent_size = max(24 * 10, int(len(x_fit) * recent_fraction))
+                if mid_recent_size >= len(x_fit):
+                    mid_recent_size = max(24 * 5, len(x_fit) // 2)
+
+                x_fit_mid = x_fit.iloc[-mid_recent_size:]
+                y_fit_mid = y_fit.iloc[-mid_recent_size:]
+                baseline_fit_mid = baseline_fit[-mid_recent_size:]
+
+                final_direct_mid_models, _ = _fit_market_models(
+                    x_train=x_fit_mid[direct_feature_cols],
+                    y_train=pd.Series(y_fit_mid.to_numpy(dtype=float) - baseline_fit_mid, index=y_fit_mid.index),
+                    x_valid=x_cal[direct_feature_cols],
+                    y_valid=pd.Series(y_cal.to_numpy(dtype=float) - baseline_cal, index=y_cal.index),
+                    cat_cols=direct_cat_cols,
+                    numeric_cols=direct_numeric_cols,
+                    seed=int(config["final_seed"]) + 37,
+                    use_gpu=bool(config["use_gpu"]),
+                    gpu_devices=str(config["gpu_devices"]),
+                    fast_dev=bool(config["fast_dev"]),
+                )
+
+                final_direct_long_models, _ = _fit_market_models(
                     x_train=x_fit[direct_feature_cols],
                     y_train=pd.Series(y_fit.to_numpy(dtype=float) - baseline_fit, index=y_fit.index),
                     x_valid=x_cal[direct_feature_cols],
                     y_valid=pd.Series(y_cal.to_numpy(dtype=float) - baseline_cal, index=y_cal.index),
                     cat_cols=direct_cat_cols,
                     numeric_cols=direct_numeric_cols,
-                    seed=int(config["final_seed"]) + 37,
+                    seed=int(config["final_seed"]) + 59,
                     use_gpu=bool(config["use_gpu"]),
                     gpu_devices=str(config["gpu_devices"]),
                     fast_dev=bool(config["fast_dev"]),
@@ -1244,10 +1358,12 @@ def run_with_ledger(
                     direct_num_fill_values=direct_num_fill_values,
                     history_targets=history_targets,
                     recursive_models=final_models,
-                    direct_models=final_direct_models,
+                    direct_mid_models=final_direct_mid_models,
+                    direct_long_models=final_direct_long_models,
                     stacker=stacker,
                     baseline_model=baseline_full,
                     recursive_steps=int(config["recursive_steps"]),
+                    mid_horizon_steps=int(config["mid_horizon_steps"]),
                 )
 
                 correction_values = [
@@ -1265,6 +1381,8 @@ def run_with_ledger(
                 model_manifest_rows.append(
                     "market="
                     f"{market}, oof_rmse={market_oof_rmse:.6f}, "
+                    f"recursive_steps={int(config['recursive_steps'])}, "
+                    f"mid_horizon_steps={int(config['mid_horizon_steps'])}, "
                     f"fold_rmse_mean_last2={fold_rmse_mean_last2:.6f}, "
                     f"fold_rmse_worst={fold_rmse_worst:.6f}, "
                     f"stacker_intercept={float(stacker_ridge.intercept_):.6f}, "
@@ -1399,7 +1517,13 @@ def main() -> None:
     parser.add_argument(
         "--exclude-2023",
         action="store_true",
-        help="Exclude all training observations where delivery_start year is 2023.",
+        help="Exclude most of 2023 from training, while keeping late-2023 tail by month threshold.",
+    )
+    parser.add_argument(
+        "--exclude-2023-keep-from-month",
+        type=int,
+        default=10,
+        help="When --exclude-2023 is set, keep 2023 rows from this month onward (1-12, default: 10).",
     )
     parser.add_argument(
         "--use-gpu",
@@ -1418,6 +1542,7 @@ def main() -> None:
         lb_score=args.lb_score,
         fast_dev=args.fast_dev,
         exclude_2023=args.exclude_2023,
+        exclude_2023_keep_from_month=args.exclude_2023_keep_from_month,
         use_gpu=args.use_gpu,
         gpu_devices=args.gpu_devices,
     )

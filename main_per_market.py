@@ -133,6 +133,7 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
     start_ts = pd.to_datetime(result["delivery_start"], errors="coerce")
     end_ts = pd.to_datetime(result["delivery_end"], errors="coerce")
+    epoch = pd.Timestamp("1970-01-01")
 
     result["delivery_start_hour"] = start_ts.dt.hour
     result["delivery_start_day"] = start_ts.dt.day
@@ -152,7 +153,7 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     result["month_x_market"] = result["market"].astype(str) + "_m" + result["delivery_start_month"].astype(str)
 
     result["delivery_duration_hours"] = (end_ts - start_ts).dt.total_seconds() / 3600.0
-    result["delivery_start_ts"] = start_ts.astype("int64") // 10**9
+    result["delivery_start_ts"] = ((start_ts - epoch) // pd.Timedelta(seconds=1)).astype("int64")
 
     if {"air_temperature_2m", "dew_point_temperature_2m"}.issubset(result.columns):
         result["temp_dew_spread"] = result["air_temperature_2m"] - result["dew_point_temperature_2m"]
@@ -390,7 +391,16 @@ def _fit_market_models(
     cat_cols: list[str],
     numeric_cols: list[str],
     seed: int,
+    use_gpu: bool,
+    gpu_devices: str,
 ) -> tuple[dict[str, object], dict[str, np.ndarray | float]]:
+    catboost_device_params: dict[str, str] = {}
+    if use_gpu:
+        catboost_device_params = {
+            "task_type": "GPU",
+            "devices": gpu_devices,
+        }
+
     pos_spike_thr = float(y_train.quantile(0.95))
     neg_spike_thr = float(y_train.quantile(0.05))
 
@@ -412,6 +422,7 @@ def _fit_market_models(
         random_strength=0.9,
         random_seed=seed,
         verbose=0,
+        **catboost_device_params,
     )
     cat_normal.fit(
         x_train,
@@ -433,6 +444,7 @@ def _fit_market_models(
         random_strength=1.1,
         random_seed=seed + 13,
         verbose=0,
+        **catboost_device_params,
     )
     cat_spike.fit(
         x_train,
@@ -458,6 +470,7 @@ def _fit_market_models(
             l2_leaf_reg=14,
             random_seed=seed + 101,
             verbose=0,
+            **catboost_device_params,
         )
         spike_classifier.fit(
             x_train,
@@ -564,6 +577,9 @@ def _recursive_predict_market(
 def _build_default_config(config_name: str) -> dict:
     return {
         "config_name": config_name,
+        "exclude_2023": False,
+        "use_gpu": False,
+        "gpu_devices": "0",
         "n_splits": 5,
         "purge_days": 2,
         "min_train_days": 10,
@@ -574,7 +590,14 @@ def _build_default_config(config_name: str) -> dict:
     }
 
 
-def run_with_ledger(config_name: str, official_run: bool, lb_score: float | None) -> dict[str, str]:
+def run_with_ledger(
+    config_name: str,
+    official_run: bool,
+    lb_score: float | None,
+    exclude_2023: bool = False,
+    use_gpu: bool = False,
+    gpu_devices: str = "0",
+) -> dict[str, str]:
     base_dir = Path(__file__).resolve().parent
     data_dir = base_dir / "data"
     runs_dir = base_dir / "runs"
@@ -614,6 +637,9 @@ def run_with_ledger(config_name: str, official_run: bool, lb_score: float | None
     registry_path = base_dir / "experiments.csv"
 
     config = _build_default_config(safe_config_name)
+    config["exclude_2023"] = bool(exclude_2023)
+    config["use_gpu"] = bool(use_gpu)
+    config["gpu_devices"] = str(gpu_devices)
     config_hash = _hash_text(_stable_json(config))
     train_hash = _sha256_file(train_path)
     test_hash = _sha256_file(test_path)
@@ -645,6 +671,15 @@ def run_with_ledger(config_name: str, official_run: bool, lb_score: float | None
             test_df = pd.read_csv(test_path)
             sample_submission = pd.read_csv(sample_submission_path)
 
+            if bool(config["exclude_2023"]):
+                train_start = pd.to_datetime(train_df["delivery_start"], errors="coerce")
+                keep_mask = train_start.dt.year != 2023
+                removed_count = int((~keep_mask).sum())
+                train_df = train_df.loc[keep_mask].reset_index(drop=True)
+                print(f"Excluded 2023 observations from training: removed {removed_count} rows")
+                if train_df.empty:
+                    raise ValueError("Training data is empty after excluding 2023 observations.")
+
             train_df = add_time_features(train_df)
             test_df = add_time_features(test_df)
 
@@ -664,6 +699,7 @@ def run_with_ledger(config_name: str, official_run: bool, lb_score: float | None
             numeric_cols = [col for col in feature_cols if col not in cat_cols]
 
             print(f"Run ID: {run_id}")
+            print(f"CatBoost device: {'GPU' if bool(config['use_gpu']) else 'CPU'} (devices={config['gpu_devices']})")
             print(f"Using {len(feature_cols)} features total")
             print(f"Categorical ({len(cat_cols)}): {cat_cols}")
 
@@ -716,6 +752,8 @@ def run_with_ledger(config_name: str, official_run: bool, lb_score: float | None
                         cat_cols=cat_cols,
                         numeric_cols=numeric_cols,
                         seed=int(config["base_seed"]) + fold_id,
+                        use_gpu=bool(config["use_gpu"]),
+                        gpu_devices=str(config["gpu_devices"]),
                     )
 
                     cat_pred = np.asarray(valid_outputs["cat_regime"], dtype=float)
@@ -788,6 +826,8 @@ def run_with_ledger(config_name: str, official_run: bool, lb_score: float | None
                     cat_cols=cat_cols,
                     numeric_cols=numeric_cols,
                     seed=int(config["final_seed"]),
+                    use_gpu=bool(config["use_gpu"]),
+                    gpu_devices=str(config["gpu_devices"]),
                 )
 
                 num_fill_values = {col: float(market_train[col].median()) for col in numeric_cols}
@@ -914,8 +954,30 @@ def main() -> None:
         default=None,
         help="Optional leaderboard score to include at run time.",
     )
+    parser.add_argument(
+        "--exclude-2023",
+        action="store_true",
+        help="Exclude all training observations where delivery_start year is 2023.",
+    )
+    parser.add_argument(
+        "--use-gpu",
+        action="store_true",
+        help="Use GPU for CatBoost models (HistGradientBoosting stays on CPU).",
+    )
+    parser.add_argument(
+        "--gpu-devices",
+        default="0",
+        help="GPU device string for CatBoost, e.g. '0' or '0:1'.",
+    )
     args = parser.parse_args()
-    run_with_ledger(config_name=args.config_name, official_run=args.official_run, lb_score=args.lb_score)
+    run_with_ledger(
+        config_name=args.config_name,
+        official_run=args.official_run,
+        lb_score=args.lb_score,
+        exclude_2023=args.exclude_2023,
+        use_gpu=args.use_gpu,
+        gpu_devices=args.gpu_devices,
+    )
 
 
 if __name__ == "__main__":

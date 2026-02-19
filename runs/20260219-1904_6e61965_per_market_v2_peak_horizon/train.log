@@ -1,0 +1,58 @@
+Excluded 2023 observations from training: removed 44924 rows
+Global OOF coverage: 74.88%
+Run ID: 20260219-1904_6e61965_per_market_v2_peak_horizon
+CatBoost device: CPU (devices=0)
+Run mode: FAST_DEV
+Using 80 features total
+Categorical (1): ['month_x_market']
+Inference mode: recursive first 6 steps, mid-horizon expert next 24 steps, then long-horizon expert
+Blending mode: residual baseline + OOF stacker + global/local signal
+Experts: normal + spike + peak (soft-gated)
+Market A | Fold 1/3 | Residual blend RMSE=90.888899
+Market A | Fold 2/3 | Residual blend RMSE=61.945265
+Market A | Fold 3/3 | Residual blend RMSE=56.253049
+Market A | Fold diagnostics | mean_all=69.695738, mean_last2=59.099157, std=15.164935, worst=90.888899
+Market A | OOF RMSE=62.370632 | learned stacker with 7 features
+Market B | Fold 1/3 | Residual blend RMSE=59.050186
+Market B | Fold 2/3 | Residual blend RMSE=63.125206
+Market B | Fold 3/3 | Residual blend RMSE=36.637710
+Market B | Fold diagnostics | mean_all=52.937701, mean_last2=49.881458, std=11.645277, worst=63.125206
+Market B | OOF RMSE=53.062120 | learned stacker with 7 features
+Market C | Fold 1/3 | Residual blend RMSE=106.436063
+Market C | Fold 2/3 | Residual blend RMSE=25.946305
+Market C | Fold 3/3 | Residual blend RMSE=28.489496
+Market C | Fold diagnostics | mean_all=53.623955, mean_last2=27.217901, std=37.358230, worst=106.436063
+Market C | OOF RMSE=64.563671 | learned stacker with 7 features
+Market D | Fold 1/3 | Residual blend RMSE=101.172782
+Market D | Fold 2/3 | Residual blend RMSE=37.582077
+Market D | Fold 3/3 | Residual blend RMSE=34.332584
+Market D | Fold diagnostics | mean_all=57.695814, mean_last2=35.957331, std=30.771468, worst=101.172782
+Market D | OOF RMSE=59.875334 | learned stacker with 7 features
+Market E | Fold 1/3 | Residual blend RMSE=59.312338
+Market E | Fold 2/3 | Residual blend RMSE=52.807212
+Market E | Fold 3/3 | Residual blend RMSE=36.662764
+Market E | Fold diagnostics | mean_all=49.594105, mean_last2=44.734988, std=9.521689, worst=59.312338
+Market E | OOF RMSE=48.740571 | learned stacker with 7 features
+Market F | Fold 1/3 | Residual blend RMSE=63.313272
+Market F | Fold 2/3 | Residual blend RMSE=27.285388
+Market F | Fold 3/3 | Residual blend RMSE=28.439479
+Market F | Fold diagnostics | mean_all=39.679380, mean_last2=27.862434, std=16.718326, worst=63.313272
+Market F | OOF RMSE=40.768492 | learned stacker with 7 features
+Per-market CV RMSE (day folds):
+  Market F: 40.768492
+  Market E: 48.740571
+  Market B: 53.062120
+  Market D: 59.875334
+  Market A: 62.370632
+  Market C: 64.563671
+Mean per-market RMSE: 54.896803
+Fold diagnostics (market-mean) | mean_all=53.871115, mean_last2=40.792211, mean_worst=80.708093
+       id      target
+0  133627  316.078578
+1  133629   34.244520
+2  133630   35.395217
+3  133631   35.036904
+4  133633   25.825677
+Saved run artifacts under: /Users/simonbisgaard/Desktop/nitor/runs/20260219-1904_6e61965_per_market_v2_peak_horizon
+Saved latest submission copy: /Users/simonbisgaard/Desktop/nitor/submission_per_market.csv
+Registry updated: /Users/simonbisgaard/Desktop/nitor/experiments.csv

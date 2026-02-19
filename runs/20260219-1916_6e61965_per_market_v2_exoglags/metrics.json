@@ -1,0 +1,140 @@
+{
+  "config": {
+    "base_seed": 42,
+    "config_name": "per_market_v2_exoglags",
+    "correction_alpha": 0.6,
+    "exclude_2023": true,
+    "fast_dev": true,
+    "final_seed": 999,
+    "gpu_devices": "0",
+    "mid_expert_recent_fraction": 0.35,
+    "mid_horizon_steps": 24,
+    "min_market_rows": 400,
+    "min_train_days": 7,
+    "n_splits": 3,
+    "purge_days": 1,
+    "recursive_steps": 6,
+    "use_gpu": false
+  },
+  "config_hash": "97d03766a265e04e325ec35fed1927161ee2f3bc7682737af88967d971e35cbf",
+  "cv_rmse": 58.86505309995862,
+  "data_hash": "d5d1c3bfcb4b55a8161356b389073d4eb23cae10fbb5f28f06ddbbdee1211ace",
+  "dirty_repo": true,
+  "fold_rmse_mean_all": 57.652572098126804,
+  "fold_rmse_mean_last2": 42.61293832277796,
+  "fold_rmse_mean_worst": 87.83723732907895,
+  "git_branch": "main",
+  "git_sha": "6e61965",
+  "lb_score": null,
+  "market_diagnostics": [
+    {
+      "fold_rmse_list": [
+        90.35316605451901,
+        65.83264500844736,
+        59.004982512496056
+      ],
+      "fold_rmse_mean_all": 71.73026452515414,
+      "fold_rmse_mean_last2": 62.41881376047171,
+      "fold_rmse_std": 13.460153288353746,
+      "fold_rmse_worst": 90.35316605451901,
+      "market": "Market A",
+      "oof_rmse": 62.428678144051645
+    },
+    {
+      "fold_rmse_list": [
+        59.81330176284576,
+        60.44568784437256,
+        36.2865115151918
+      ],
+      "fold_rmse_mean_all": 52.18183370747004,
+      "fold_rmse_mean_last2": 48.36609967978218,
+      "fold_rmse_std": 11.242654749843771,
+      "fold_rmse_worst": 60.44568784437256,
+      "market": "Market B",
+      "oof_rmse": 50.860135409678925
+    },
+    {
+      "fold_rmse_list": [
+        118.65935067038679,
+        30.135099514528626,
+        29.622643000016787
+      ],
+      "fold_rmse_mean_all": 59.4723643949774,
+      "fold_rmse_mean_last2": 29.878871257272706,
+      "fold_rmse_std": 41.85204225358615,
+      "fold_rmse_worst": 118.65935067038679,
+      "market": "Market C",
+      "oof_rmse": 69.81502254120063
+    },
+    {
+      "fold_rmse_list": [
+        121.76414718038616,
+        41.693624190334965,
+        38.74279359271067
+      ],
+      "fold_rmse_mean_all": 67.40018832114394,
+      "fold_rmse_mean_last2": 40.21820889152282,
+      "fold_rmse_std": 38.4599953843038,
+      "fold_rmse_worst": 121.76414718038616,
+      "market": "Market D",
+      "oof_rmse": 69.47230337508994
+    },
+    {
+      "fold_rmse_list": [
+        60.879501685892706,
+        53.20618876417428,
+        38.0410018676555
+      ],
+      "fold_rmse_mean_all": 50.70889743924082,
+      "fold_rmse_mean_last2": 45.62359531591489,
+      "fold_rmse_std": 9.489524626593827,
+      "fold_rmse_worst": 60.879501685892706,
+      "market": "Market E",
+      "oof_rmse": 49.45430830547591
+    },
+    {
+      "fold_rmse_list": [
+        74.92157053891646,
+        29.688358905589926,
+        28.655723157817004
+      ],
+      "fold_rmse_mean_all": 44.42188420077446,
+      "fold_rmse_mean_last2": 29.172041031703465,
+      "fold_rmse_std": 21.570654976776183,
+      "fold_rmse_worst": 74.92157053891646,
+      "market": "Market F",
+      "oof_rmse": 46.47802396207564
+    }
+  ],
+  "market_scores": [
+    {
+      "market": "Market A",
+      "rmse": 62.428678144051645
+    },
+    {
+      "market": "Market B",
+      "rmse": 50.860135409678925
+    },
+    {
+      "market": "Market C",
+      "rmse": 69.81502254120063
+    },
+    {
+      "market": "Market D",
+      "rmse": 69.47230337508994
+    },
+    {
+      "market": "Market E",
+      "rmse": 49.45430830547591
+    },
+    {
+      "market": "Market F",
+      "rmse": 46.47802396207564
+    }
+  ],
+  "model_path": "/Users/simonbisgaard/Desktop/nitor/runs/20260219-1916_6e61965_per_market_v2_exoglags/models_manifest.txt",
+  "oof_path": "/Users/simonbisgaard/Desktop/nitor/runs/20260219-1916_6e61965_per_market_v2_exoglags/oof.csv",
+  "run_id": "20260219-1916_6e61965_per_market_v2_exoglags",
+  "started_at": "2026-02-19T18:16:53.940312+00:00",
+  "submission_path": "/Users/simonbisgaard/Desktop/nitor/runs/20260219-1916_6e61965_per_market_v2_exoglags/submission.csv"
+}

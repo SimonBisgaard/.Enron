@@ -1,0 +1,23 @@
+run_id: "20260219-1916_6e61965_per_market_v2_exoglags"
+started_at: "2026-02-19T18:16:53.940312+00:00"
+git_sha: "6e61965"
+git_branch: "main"
+dirty_repo: true
+data_hash: "d5d1c3bfcb4b55a8161356b389073d4eb23cae10fbb5f28f06ddbbdee1211ace"
+config_hash: "97d03766a265e04e325ec35fed1927161ee2f3bc7682737af88967d971e35cbf"
+config:
+  config_name: "per_market_v2_exoglags"
+  fast_dev: true
+  exclude_2023: true
+  use_gpu: false
+  gpu_devices: "0"
+  recursive_steps: 6
+  mid_horizon_steps: 24
+  mid_expert_recent_fraction: 0.35
+  n_splits: 3
+  purge_days: 1
+  min_train_days: 7
+  base_seed: 42
+  final_seed: 999
+  correction_alpha: 0.6
+  min_market_rows: 400

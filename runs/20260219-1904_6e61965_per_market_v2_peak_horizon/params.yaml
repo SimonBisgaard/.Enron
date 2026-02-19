@@ -1,0 +1,23 @@
+run_id: "20260219-1904_6e61965_per_market_v2_peak_horizon"
+started_at: "2026-02-19T18:04:01.749643+00:00"
+git_sha: "6e61965"
+git_branch: "main"
+dirty_repo: true
+data_hash: "d5d1c3bfcb4b55a8161356b389073d4eb23cae10fbb5f28f06ddbbdee1211ace"
+config_hash: "7d2f6ad4e3a2b37dbc0839953bc96579bab3db86a9c6c3e6d5faf12c558f8a83"
+config:
+  config_name: "per_market_v2_peak_horizon"
+  fast_dev: true
+  exclude_2023: true
+  use_gpu: false
+  gpu_devices: "0"
+  recursive_steps: 6
+  mid_horizon_steps: 24
+  mid_expert_recent_fraction: 0.35
+  n_splits: 3
+  purge_days: 1
+  min_train_days: 7
+  base_seed: 42
+  final_seed: 999
+  correction_alpha: 0.6
+  min_market_rows: 400

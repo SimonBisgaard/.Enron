@@ -586,9 +586,6 @@ def _build_meta_matrix(
     cat_spike: np.ndarray,
     hgb: np.ndarray,
     p_spike: np.ndarray,
-    global_delta: np.ndarray,
-    hour: np.ndarray,
-    dow: np.ndarray,
 ) -> np.ndarray:
     return np.column_stack(
         [
@@ -596,10 +593,6 @@ def _build_meta_matrix(
             cat_spike,
             hgb,
             p_spike,
-            p_spike * cat_spike + (1.0 - p_spike) * cat_normal,
-            global_delta,
-            hour.astype(float),
-            dow.astype(float),
         ]
     )
 
@@ -607,18 +600,12 @@ def _build_meta_matrix(
 def _stack_residual_prediction(
     stacker,
     components: dict[str, float],
-    global_delta: float,
-    hour: int,
-    dow: int,
 ) -> float:
     row = _build_meta_matrix(
         cat_normal=np.array([components["cat_normal"]], dtype=float),
         cat_spike=np.array([components["cat_spike"]], dtype=float),
         hgb=np.array([components["hgb"]], dtype=float),
         p_spike=np.array([components["p_spike"]], dtype=float),
-        global_delta=np.array([global_delta], dtype=float),
-        hour=np.array([hour], dtype=float),
-        dow=np.array([dow], dtype=float),
     )
     return float(stacker.predict(row)[0])
 
@@ -638,7 +625,6 @@ def _hybrid_predict_market(
     direct_models: dict[str, object],
     stacker,
     baseline_model: dict[str, object],
-    global_test_pred_by_id: dict[int, float],
     recursive_steps: int,
 ) -> pd.Series:
     preds: list[float] = []
@@ -664,14 +650,9 @@ def _hybrid_predict_market(
                 models=direct_models,
             )
             baseline_pred = float(_predict_baseline(baseline_model, row_df_direct)[0])
-            test_id = int(test_market_df.loc[idx, "id"])
-            global_delta = float(global_test_pred_by_id.get(test_id, baseline_pred) - baseline_pred)
             residual_pred = _stack_residual_prediction(
                 stacker=stacker,
                 components=components,
-                global_delta=global_delta,
-                hour=int(test_market_df.loc[idx, "delivery_start_hour"]),
-                dow=int(test_market_df.loc[idx, "delivery_start_dow"]),
             )
             pred = baseline_pred + residual_pred
             preds.append(pred)
@@ -708,14 +689,9 @@ def _hybrid_predict_market(
             models=recursive_models,
         )
         baseline_pred = float(_predict_baseline(baseline_model, row_df)[0])
-        test_id = int(test_market_df.loc[idx, "id"])
-        global_delta = float(global_test_pred_by_id.get(test_id, baseline_pred) - baseline_pred)
         residual_pred = _stack_residual_prediction(
             stacker=stacker,
             components=components,
-            global_delta=global_delta,
-            hour=int(test_market_df.loc[idx, "delivery_start_hour"]),
-            dow=int(test_market_df.loc[idx, "delivery_start_dow"]),
         )
         pred = baseline_pred + residual_pred
         preds.append(pred)
@@ -923,7 +899,7 @@ def run_with_ledger(
             if global_valid_cov < 0.70:
                 print(
                     "Warning: low global OOF coverage. "
-                    "Missing rows will use neutral global_delta=0 in the stacker."
+                    "Global model may be weak in early folds."
                 )
 
             final_global_device_params: dict[str, str] = {}
@@ -952,8 +928,6 @@ def run_with_ledger(
                 cat_features=direct_cat_cols,
             )
             global_test_pred = np.asarray(final_global_model.predict(global_test_x), dtype=float)
-            global_oof_by_id = dict(zip(train_df["id"].astype(int).tolist(), global_oof.tolist()))
-            global_test_pred_by_id = dict(zip(test_df["id"].astype(int).tolist(), global_test_pred.tolist()))
 
             print(f"Run ID: {run_id}")
             print(f"CatBoost device: {'GPU' if bool(config['use_gpu']) else 'CPU'} (devices={config['gpu_devices']})")
@@ -965,6 +939,7 @@ def run_with_ledger(
 
             predictions_by_id: dict[int, float] = {}
             market_scores: list[tuple[str, float]] = []
+            market_diagnostics: list[dict[str, object]] = []
             model_manifest_rows: list[str] = []
             oof_frames: list[pd.DataFrame] = []
 
@@ -999,9 +974,7 @@ def run_with_ledger(
                 oof_cat_spike = np.full(len(market_train), np.nan, dtype=float)
                 oof_hgb = np.full(len(market_train), np.nan, dtype=float)
                 oof_p_spike = np.full(len(market_train), np.nan, dtype=float)
-                oof_global_delta = np.full(len(market_train), np.nan, dtype=float)
                 fold_records: list[dict[str, float | int]] = []
-                global_market_oof = market_train["id"].astype(int).map(global_oof_by_id).to_numpy(dtype=float)
 
                 for fold_id, (train_idx, valid_idx) in enumerate(folds, start=1):
                     x_train = market_train.iloc[train_idx][feature_cols].copy()
@@ -1042,7 +1015,6 @@ def run_with_ledger(
                     oof_cat_spike[valid_idx] = cat_spike_pred
                     oof_hgb[valid_idx] = hgb_pred
                     oof_p_spike[valid_idx] = p_spike_pred
-                    oof_global_delta[valid_idx] = np.nan_to_num(global_market_oof[valid_idx] - baseline_valid, nan=0.0)
 
                     fold_blend = baseline_valid + (
                         0.5 * (p_spike_pred * cat_spike_pred + (1.0 - p_spike_pred) * cat_normal_pred)
@@ -1056,6 +1028,20 @@ def run_with_ledger(
                         }
                     )
                     print(f"{market} | Fold {fold_id}/{len(folds)} | Residual blend RMSE={rmse_fold:.6f}")
+
+                fold_rmse_list = [float(record["rmse_fold"]) for record in fold_records]
+                if not fold_rmse_list:
+                    continue
+                fold_rmse_mean_all = float(np.mean(fold_rmse_list))
+                fold_rmse_mean_last2 = float(np.mean(fold_rmse_list[-2:]))
+                fold_rmse_std = float(np.std(fold_rmse_list))
+                fold_rmse_worst = float(np.max(fold_rmse_list))
+
+                print(
+                    f"{market} | Fold diagnostics | mean_all={fold_rmse_mean_all:.6f}, "
+                    f"mean_last2={fold_rmse_mean_last2:.6f}, std={fold_rmse_std:.6f}, "
+                    f"worst={fold_rmse_worst:.6f}"
+                )
 
                 valid_mask = (
                     (~np.isnan(oof_baseline))
@@ -1072,9 +1058,6 @@ def run_with_ledger(
                     cat_spike=oof_cat_spike[valid_mask],
                     hgb=oof_hgb[valid_mask],
                     p_spike=oof_p_spike[valid_mask],
-                    global_delta=np.nan_to_num(oof_global_delta[valid_mask], nan=0.0),
-                    hour=market_train.loc[valid_mask, "delivery_start_hour"].to_numpy(dtype=float),
-                    dow=market_train.loc[valid_mask, "delivery_start_dow"].to_numpy(dtype=float),
                 )
                 y_residual_target = y_all[valid_mask].to_numpy(dtype=float) - oof_baseline[valid_mask]
                 stacker = make_pipeline(
@@ -1087,6 +1070,17 @@ def run_with_ledger(
                 oof_blend = oof_baseline[valid_mask] + oof_residual
                 market_oof_rmse = float(mean_squared_error(y_all[valid_mask], oof_blend) ** 0.5)
                 market_scores.append((market, market_oof_rmse))
+                market_diagnostics.append(
+                    {
+                        "market": market,
+                        "fold_rmse_list": fold_rmse_list,
+                        "fold_rmse_mean_all": fold_rmse_mean_all,
+                        "fold_rmse_mean_last2": fold_rmse_mean_last2,
+                        "fold_rmse_std": fold_rmse_std,
+                        "fold_rmse_worst": fold_rmse_worst,
+                        "oof_rmse": market_oof_rmse,
+                    }
+                )
 
                 oof_market = pd.DataFrame(
                     {
@@ -1167,7 +1161,6 @@ def run_with_ledger(
                     direct_models=final_direct_models,
                     stacker=stacker,
                     baseline_model=baseline_full,
-                    global_test_pred_by_id=global_test_pred_by_id,
                     recursive_steps=int(config["recursive_steps"]),
                 )
 
@@ -1186,6 +1179,8 @@ def run_with_ledger(
                 model_manifest_rows.append(
                     "market="
                     f"{market}, oof_rmse={market_oof_rmse:.6f}, "
+                    f"fold_rmse_mean_last2={fold_rmse_mean_last2:.6f}, "
+                    f"fold_rmse_worst={fold_rmse_worst:.6f}, "
                     f"stacker_intercept={float(stacker_ridge.intercept_):.6f}, "
                     f"stacker_coef={','.join(f'{c:.6f}' for c in stacker_coef.tolist())}"
                 )
@@ -1218,6 +1213,14 @@ def run_with_ledger(
                 for market, score in sorted(market_scores, key=lambda x: x[1]):
                     print(f"  {market}: {score:.6f}")
                 print(f"Mean per-market RMSE: {np.mean([score for _, score in market_scores]):.6f}")
+            if market_diagnostics:
+                mean_recent2 = float(np.mean([float(d["fold_rmse_mean_last2"]) for d in market_diagnostics]))
+                mean_allfold = float(np.mean([float(d["fold_rmse_mean_all"]) for d in market_diagnostics]))
+                mean_worst = float(np.mean([float(d["fold_rmse_worst"]) for d in market_diagnostics]))
+                print(
+                    f"Fold diagnostics (market-mean) | mean_all={mean_allfold:.6f}, "
+                    f"mean_last2={mean_recent2:.6f}, mean_worst={mean_worst:.6f}"
+                )
             print(submission.head())
 
             metrics = {
@@ -1226,6 +1229,22 @@ def run_with_ledger(
                 "cv_rmse": cv_rmse,
                 "lb_score": lb_score,
                 "market_scores": [{"market": market, "rmse": score} for market, score in market_scores],
+                "market_diagnostics": market_diagnostics,
+                "fold_rmse_mean_all": (
+                    float(np.mean([float(d["fold_rmse_mean_all"]) for d in market_diagnostics]))
+                    if market_diagnostics
+                    else float("nan")
+                ),
+                "fold_rmse_mean_last2": (
+                    float(np.mean([float(d["fold_rmse_mean_last2"]) for d in market_diagnostics]))
+                    if market_diagnostics
+                    else float("nan")
+                ),
+                "fold_rmse_mean_worst": (
+                    float(np.mean([float(d["fold_rmse_worst"]) for d in market_diagnostics]))
+                    if market_diagnostics
+                    else float("nan")
+                ),
                 "git_sha": git_sha,
                 "git_branch": str(git_info["git_branch"]),
                 "dirty_repo": bool(git_info["dirty_repo"]),

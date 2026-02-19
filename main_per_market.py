@@ -512,26 +512,77 @@ def _fit_market_models(
     return models, valid_outputs
 
 
-def _recursive_predict_market(
-    test_market_df: pd.DataFrame,
-    feature_cols: list[str],
+def _predict_with_models(
+    row_df: pd.DataFrame,
     numeric_cols: list[str],
-    cat_cols: list[str],
-    num_fill_values: dict[str, float],
-    history_targets: list[float],
     models: dict[str, object],
     cat_weight: float,
     hgb_weight: float,
-) -> pd.Series:
-    preds: list[float] = []
-
+) -> float:
     cat_normal: CatBoostRegressor = models["cat_normal"]  # type: ignore[assignment]
     cat_spike: CatBoostRegressor = models["cat_spike"]  # type: ignore[assignment]
     spike_classifier: CatBoostClassifier | None = models["spike_classifier"]  # type: ignore[assignment]
     spike_threshold: float = float(models["spike_threshold"])
     hgb: HistGradientBoostingRegressor = models["hgb"]  # type: ignore[assignment]
 
-    for idx in test_market_df.index:
+    cat_normal_pred = float(cat_normal.predict(row_df)[0])
+    cat_spike_pred = float(cat_spike.predict(row_df)[0])
+
+    if spike_classifier is not None:
+        p_spike = float(spike_classifier.predict_proba(row_df)[:, 1][0])
+    else:
+        p_spike = 0.15
+
+    cat_regime_pred = cat_spike_pred if p_spike >= spike_threshold else cat_normal_pred
+    hgb_pred = float(hgb.predict(row_df[numeric_cols])[0])
+    return cat_weight * cat_regime_pred + hgb_weight * hgb_pred
+
+
+def _hybrid_predict_market(
+    test_market_df: pd.DataFrame,
+    feature_cols: list[str],
+    numeric_cols: list[str],
+    cat_cols: list[str],
+    num_fill_values: dict[str, float],
+    direct_feature_cols: list[str],
+    direct_numeric_cols: list[str],
+    direct_cat_cols: list[str],
+    direct_num_fill_values: dict[str, float],
+    history_targets: list[float],
+    recursive_models: dict[str, object],
+    direct_models: dict[str, object],
+    cat_weight: float,
+    hgb_weight: float,
+    recursive_steps: int,
+) -> pd.Series:
+    preds: list[float] = []
+
+    for step_idx, idx in enumerate(test_market_df.index):
+        use_recursive = step_idx < recursive_steps
+
+        if not use_recursive:
+            row_direct = test_market_df.loc[idx, direct_feature_cols].copy()
+            row_df_direct = pd.DataFrame([row_direct], columns=direct_feature_cols)
+            row_direct_id = row_df_direct.index[0]
+
+            for col, fill_value in direct_num_fill_values.items():
+                if pd.isna(row_df_direct.at[row_direct_id, col]):
+                    row_df_direct.at[row_direct_id, col] = fill_value
+
+            for col in direct_cat_cols:
+                row_df_direct.at[row_direct_id, col] = str(row_df_direct.at[row_direct_id, col])
+
+            pred = _predict_with_models(
+                row_df=row_df_direct,
+                numeric_cols=direct_numeric_cols,
+                models=direct_models,
+                cat_weight=cat_weight,
+                hgb_weight=hgb_weight,
+            )
+            preds.append(pred)
+            history_targets.append(pred)
+            continue
+
         row = test_market_df.loc[idx, feature_cols].copy()
 
         for lag in LAG_STEPS:
@@ -556,18 +607,13 @@ def _recursive_predict_market(
         for col in cat_cols:
             row_df.at[row_id, col] = str(row_df.at[row_id, col])
 
-        cat_normal_pred = float(cat_normal.predict(row_df)[0])
-        cat_spike_pred = float(cat_spike.predict(row_df)[0])
-
-        if spike_classifier is not None:
-            p_spike = float(spike_classifier.predict_proba(row_df)[:, 1][0])
-        else:
-            p_spike = 0.15
-
-        cat_regime_pred = cat_spike_pred if p_spike >= spike_threshold else cat_normal_pred
-        hgb_pred = float(hgb.predict(row_df[numeric_cols])[0])
-
-        pred = cat_weight * cat_regime_pred + hgb_weight * hgb_pred
+        pred = _predict_with_models(
+            row_df=row_df,
+            numeric_cols=numeric_cols,
+            models=recursive_models,
+            cat_weight=cat_weight,
+            hgb_weight=hgb_weight,
+        )
         preds.append(pred)
         history_targets.append(pred)
 
@@ -580,6 +626,7 @@ def _build_default_config(config_name: str) -> dict:
         "exclude_2023": False,
         "use_gpu": False,
         "gpu_devices": "0",
+        "recursive_steps": 12,
         "n_splits": 5,
         "purge_days": 2,
         "min_train_days": 10,
@@ -697,11 +744,19 @@ def run_with_ledger(
 
             cat_cols = train_df[feature_cols].select_dtypes(include=["object", "category", "string"]).columns.tolist()
             numeric_cols = [col for col in feature_cols if col not in cat_cols]
+            direct_feature_cols = [
+                col
+                for col in feature_cols
+                if not col.startswith("target_lag_") and not col.startswith("target_roll_")
+            ]
+            direct_cat_cols = [col for col in cat_cols if col in direct_feature_cols]
+            direct_numeric_cols = [col for col in direct_feature_cols if col not in direct_cat_cols]
 
             print(f"Run ID: {run_id}")
             print(f"CatBoost device: {'GPU' if bool(config['use_gpu']) else 'CPU'} (devices={config['gpu_devices']})")
             print(f"Using {len(feature_cols)} features total")
             print(f"Categorical ({len(cat_cols)}): {cat_cols}")
+            print(f"Inference mode: recursive first {int(config['recursive_steps'])} steps, then direct")
 
             predictions_by_id: dict[int, float] = {}
             market_scores: list[tuple[str, float]] = []
@@ -830,18 +885,37 @@ def run_with_ledger(
                     gpu_devices=str(config["gpu_devices"]),
                 )
 
+                final_direct_models, _ = _fit_market_models(
+                    x_train=x_fit[direct_feature_cols],
+                    y_train=y_fit,
+                    x_valid=x_cal[direct_feature_cols],
+                    y_valid=y_cal,
+                    cat_cols=direct_cat_cols,
+                    numeric_cols=direct_numeric_cols,
+                    seed=int(config["final_seed"]) + 37,
+                    use_gpu=bool(config["use_gpu"]),
+                    gpu_devices=str(config["gpu_devices"]),
+                )
+
                 num_fill_values = {col: float(market_train[col].median()) for col in numeric_cols}
+                direct_num_fill_values = {col: float(market_train[col].median()) for col in direct_numeric_cols}
                 history_targets = y_full.astype(float).tolist()
-                test_preds = _recursive_predict_market(
+                test_preds = _hybrid_predict_market(
                     test_market_df=market_test,
                     feature_cols=feature_cols,
                     numeric_cols=numeric_cols,
                     cat_cols=cat_cols,
                     num_fill_values=num_fill_values,
+                    direct_feature_cols=direct_feature_cols,
+                    direct_numeric_cols=direct_numeric_cols,
+                    direct_cat_cols=direct_cat_cols,
+                    direct_num_fill_values=direct_num_fill_values,
                     history_targets=history_targets,
-                    models=final_models,
+                    recursive_models=final_models,
+                    direct_models=final_direct_models,
                     cat_weight=cat_weight,
                     hgb_weight=hgb_weight,
+                    recursive_steps=int(config["recursive_steps"]),
                 )
 
                 correction_values = [

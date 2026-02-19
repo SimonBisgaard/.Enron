@@ -11,7 +11,10 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier, CatBoostRegressor
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 LAG_STEPS = [1, 2, 24, 48, 168]
 ROLL_WINDOWS = [24, 48, 168]
@@ -374,13 +377,42 @@ def _f1_score_binary(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return 2.0 * precision * recall / (precision + recall + 1e-9)
 
 
-def _calibrate_spike_threshold(probabilities: np.ndarray, spike_truth: np.ndarray) -> float:
-    thresholds = np.linspace(0.15, 0.85, 15)
-    scores = [
-        _f1_score_binary(spike_truth.astype(int), (probabilities >= thr).astype(int))
-        for thr in thresholds
-    ]
-    return float(thresholds[int(np.argmax(scores))])
+def _fit_ridge_baseline(
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    numeric_cols: list[str],
+) -> dict[str, object]:
+    if not numeric_cols:
+        return {"kind": "constant", "mean": float(y_train.mean()), "cols": [], "fill": {}}
+
+    fill = {col: float(x_train[col].median()) for col in numeric_cols}
+    x_mat = x_train[numeric_cols].copy()
+    for col, val in fill.items():
+        x_mat[col] = x_mat[col].fillna(val)
+
+    model = make_pipeline(
+        StandardScaler(),
+        Ridge(alpha=25.0, solver="svd"),
+    )
+    model.fit(x_mat, y_train)
+    return {"kind": "ridge", "model": model, "cols": numeric_cols, "fill": fill}
+
+
+def _predict_baseline(
+    baseline: dict[str, object],
+    x_df: pd.DataFrame,
+) -> np.ndarray:
+    if baseline["kind"] == "constant":
+        return np.full(len(x_df), float(baseline["mean"]), dtype=float)
+
+    cols: list[str] = baseline["cols"]  # type: ignore[assignment]
+    fill: dict[str, float] = baseline["fill"]  # type: ignore[assignment]
+    model = baseline["model"]  # type: ignore[assignment]
+
+    x_mat = x_df[cols].copy()
+    for col, val in fill.items():
+        x_mat[col] = x_mat[col].fillna(val)
+    return model.predict(x_mat)
 
 
 def _fit_market_models(
@@ -393,7 +425,8 @@ def _fit_market_models(
     seed: int,
     use_gpu: bool,
     gpu_devices: str,
-) -> tuple[dict[str, object], dict[str, np.ndarray | float]]:
+    fast_dev: bool,
+) -> tuple[dict[str, object], dict[str, np.ndarray]]:
     catboost_device_params: dict[str, str] = {}
     if use_gpu:
         catboost_device_params = {
@@ -405,18 +438,28 @@ def _fit_market_models(
     neg_spike_thr = float(y_train.quantile(0.05))
 
     spike_labels_train = ((y_train >= pos_spike_thr) | (y_train <= neg_spike_thr)).astype(int)
-    spike_labels_valid = ((y_valid >= pos_spike_thr) | (y_valid <= neg_spike_thr)).astype(int)
-
     spike_weights = np.ones(len(y_train), dtype=float)
     spike_weights[y_train.values >= pos_spike_thr] = 4.0
     spike_weights[y_train.values <= neg_spike_thr] = 3.0
 
+    normal_iterations = 900 if fast_dev else 2800
+    normal_lr = 0.05 if fast_dev else 0.028
+    normal_depth = 7 if fast_dev else 8
+    normal_es_rounds = 100 if fast_dev else 200
+    spike_iterations = 1100 if fast_dev else 3200
+    spike_lr = 0.04 if fast_dev else 0.022
+    spike_depth = 7 if fast_dev else 8
+    spike_es_rounds = 100 if fast_dev else 200
+    spike_clf_iterations = 300 if fast_dev else 900
+    hgb_max_iter = 250 if fast_dev else 700
+    hgb_depth = 6 if fast_dev else 7
+
     cat_normal = CatBoostRegressor(
         loss_function="RMSE",
         eval_metric="RMSE",
-        iterations=2800,
-        learning_rate=0.028,
-        depth=8,
+        iterations=normal_iterations,
+        learning_rate=normal_lr,
+        depth=normal_depth,
         l2_leaf_reg=24,
         bagging_temperature=0.5,
         random_strength=0.9,
@@ -430,15 +473,15 @@ def _fit_market_models(
         cat_features=cat_cols,
         eval_set=(x_valid, y_valid),
         use_best_model=True,
-        early_stopping_rounds=200,
+        early_stopping_rounds=normal_es_rounds,
     )
 
     cat_spike = CatBoostRegressor(
         loss_function="MAE",
         eval_metric="RMSE",
-        iterations=3200,
-        learning_rate=0.022,
-        depth=8,
+        iterations=spike_iterations,
+        learning_rate=spike_lr,
+        depth=spike_depth,
         l2_leaf_reg=28,
         bagging_temperature=0.7,
         random_strength=1.1,
@@ -453,18 +496,17 @@ def _fit_market_models(
         sample_weight=spike_weights,
         eval_set=(x_valid, y_valid),
         use_best_model=True,
-        early_stopping_rounds=200,
+        early_stopping_rounds=spike_es_rounds,
     )
 
     spike_classifier: CatBoostClassifier | None = None
-    spike_threshold = 0.30
     p_spike_valid = np.full(len(x_valid), 0.15)
 
     if spike_labels_train.sum() >= 30 and spike_labels_train.sum() < len(spike_labels_train) - 30:
         spike_classifier = CatBoostClassifier(
             loss_function="Logloss",
             eval_metric="AUC",
-            iterations=900,
+            iterations=spike_clf_iterations,
             learning_rate=0.035,
             depth=6,
             l2_leaf_reg=14,
@@ -478,51 +520,48 @@ def _fit_market_models(
             cat_features=cat_cols,
         )
         p_spike_valid = spike_classifier.predict_proba(x_valid)[:, 1]
-        spike_threshold = _calibrate_spike_threshold(p_spike_valid, spike_labels_valid.to_numpy())
+    p_spike_valid = np.clip(p_spike_valid, 0.0, 1.0)
 
-    cat_normal_valid = cat_normal.predict(x_valid)
-    cat_spike_valid = cat_spike.predict(x_valid)
-    cat_regime_valid = np.where(p_spike_valid >= spike_threshold, cat_spike_valid, cat_normal_valid)
+    cat_normal_valid = np.asarray(cat_normal.predict(x_valid), dtype=float)
+    cat_spike_valid = np.asarray(cat_spike.predict(x_valid), dtype=float)
 
     hgb = HistGradientBoostingRegressor(
         learning_rate=0.04,
-        max_depth=7,
-        max_iter=700,
+        max_depth=hgb_depth,
+        max_iter=hgb_max_iter,
         min_samples_leaf=30,
         l2_regularization=1.5,
         random_state=seed,
     )
     hgb.fit(x_train[numeric_cols], y_train)
-    hgb_valid = hgb.predict(x_valid[numeric_cols])
+    hgb_valid = np.asarray(hgb.predict(x_valid[numeric_cols]), dtype=float)
 
     models = {
         "cat_normal": cat_normal,
         "cat_spike": cat_spike,
         "spike_classifier": spike_classifier,
-        "spike_threshold": spike_threshold,
         "hgb": hgb,
         "pos_spike_thr": pos_spike_thr,
         "neg_spike_thr": neg_spike_thr,
     }
 
     valid_outputs = {
-        "cat_regime": cat_regime_valid,
+        "cat_normal": cat_normal_valid,
+        "cat_spike": cat_spike_valid,
         "hgb": hgb_valid,
+        "p_spike": p_spike_valid,
     }
     return models, valid_outputs
 
 
-def _predict_with_models(
+def _predict_model_components(
     row_df: pd.DataFrame,
     numeric_cols: list[str],
     models: dict[str, object],
-    cat_weight: float,
-    hgb_weight: float,
-) -> float:
+) -> dict[str, float]:
     cat_normal: CatBoostRegressor = models["cat_normal"]  # type: ignore[assignment]
     cat_spike: CatBoostRegressor = models["cat_spike"]  # type: ignore[assignment]
     spike_classifier: CatBoostClassifier | None = models["spike_classifier"]  # type: ignore[assignment]
-    spike_threshold: float = float(models["spike_threshold"])
     hgb: HistGradientBoostingRegressor = models["hgb"]  # type: ignore[assignment]
 
     cat_normal_pred = float(cat_normal.predict(row_df)[0])
@@ -533,9 +572,55 @@ def _predict_with_models(
     else:
         p_spike = 0.15
 
-    cat_regime_pred = cat_spike_pred if p_spike >= spike_threshold else cat_normal_pred
     hgb_pred = float(hgb.predict(row_df[numeric_cols])[0])
-    return cat_weight * cat_regime_pred + hgb_weight * hgb_pred
+    return {
+        "cat_normal": cat_normal_pred,
+        "cat_spike": cat_spike_pred,
+        "hgb": hgb_pred,
+        "p_spike": float(np.clip(p_spike, 0.0, 1.0)),
+    }
+
+
+def _build_meta_matrix(
+    cat_normal: np.ndarray,
+    cat_spike: np.ndarray,
+    hgb: np.ndarray,
+    p_spike: np.ndarray,
+    global_delta: np.ndarray,
+    hour: np.ndarray,
+    dow: np.ndarray,
+) -> np.ndarray:
+    return np.column_stack(
+        [
+            cat_normal,
+            cat_spike,
+            hgb,
+            p_spike,
+            p_spike * cat_spike + (1.0 - p_spike) * cat_normal,
+            global_delta,
+            hour.astype(float),
+            dow.astype(float),
+        ]
+    )
+
+
+def _stack_residual_prediction(
+    stacker,
+    components: dict[str, float],
+    global_delta: float,
+    hour: int,
+    dow: int,
+) -> float:
+    row = _build_meta_matrix(
+        cat_normal=np.array([components["cat_normal"]], dtype=float),
+        cat_spike=np.array([components["cat_spike"]], dtype=float),
+        hgb=np.array([components["hgb"]], dtype=float),
+        p_spike=np.array([components["p_spike"]], dtype=float),
+        global_delta=np.array([global_delta], dtype=float),
+        hour=np.array([hour], dtype=float),
+        dow=np.array([dow], dtype=float),
+    )
+    return float(stacker.predict(row)[0])
 
 
 def _hybrid_predict_market(
@@ -551,8 +636,9 @@ def _hybrid_predict_market(
     history_targets: list[float],
     recursive_models: dict[str, object],
     direct_models: dict[str, object],
-    cat_weight: float,
-    hgb_weight: float,
+    stacker,
+    baseline_model: dict[str, object],
+    global_test_pred_by_id: dict[int, float],
     recursive_steps: int,
 ) -> pd.Series:
     preds: list[float] = []
@@ -572,13 +658,22 @@ def _hybrid_predict_market(
             for col in direct_cat_cols:
                 row_df_direct.at[row_direct_id, col] = str(row_df_direct.at[row_direct_id, col])
 
-            pred = _predict_with_models(
+            components = _predict_model_components(
                 row_df=row_df_direct,
                 numeric_cols=direct_numeric_cols,
                 models=direct_models,
-                cat_weight=cat_weight,
-                hgb_weight=hgb_weight,
             )
+            baseline_pred = float(_predict_baseline(baseline_model, row_df_direct)[0])
+            test_id = int(test_market_df.loc[idx, "id"])
+            global_delta = float(global_test_pred_by_id.get(test_id, baseline_pred) - baseline_pred)
+            residual_pred = _stack_residual_prediction(
+                stacker=stacker,
+                components=components,
+                global_delta=global_delta,
+                hour=int(test_market_df.loc[idx, "delivery_start_hour"]),
+                dow=int(test_market_df.loc[idx, "delivery_start_dow"]),
+            )
+            pred = baseline_pred + residual_pred
             preds.append(pred)
             history_targets.append(pred)
             continue
@@ -607,13 +702,22 @@ def _hybrid_predict_market(
         for col in cat_cols:
             row_df.at[row_id, col] = str(row_df.at[row_id, col])
 
-        pred = _predict_with_models(
+        components = _predict_model_components(
             row_df=row_df,
             numeric_cols=numeric_cols,
             models=recursive_models,
-            cat_weight=cat_weight,
-            hgb_weight=hgb_weight,
         )
+        baseline_pred = float(_predict_baseline(baseline_model, row_df)[0])
+        test_id = int(test_market_df.loc[idx, "id"])
+        global_delta = float(global_test_pred_by_id.get(test_id, baseline_pred) - baseline_pred)
+        residual_pred = _stack_residual_prediction(
+            stacker=stacker,
+            components=components,
+            global_delta=global_delta,
+            hour=int(test_market_df.loc[idx, "delivery_start_hour"]),
+            dow=int(test_market_df.loc[idx, "delivery_start_dow"]),
+        )
+        pred = baseline_pred + residual_pred
         preds.append(pred)
         history_targets.append(pred)
 
@@ -623,6 +727,7 @@ def _hybrid_predict_market(
 def _build_default_config(config_name: str) -> dict:
     return {
         "config_name": config_name,
+        "fast_dev": False,
         "exclude_2023": False,
         "use_gpu": False,
         "gpu_devices": "0",
@@ -641,6 +746,7 @@ def run_with_ledger(
     config_name: str,
     official_run: bool,
     lb_score: float | None,
+    fast_dev: bool = False,
     exclude_2023: bool = False,
     use_gpu: bool = False,
     gpu_devices: str = "0",
@@ -684,9 +790,15 @@ def run_with_ledger(
     registry_path = base_dir / "experiments.csv"
 
     config = _build_default_config(safe_config_name)
+    config["fast_dev"] = bool(fast_dev)
     config["exclude_2023"] = bool(exclude_2023)
     config["use_gpu"] = bool(use_gpu)
     config["gpu_devices"] = str(gpu_devices)
+    if bool(config["fast_dev"]):
+        config["recursive_steps"] = 6
+        config["n_splits"] = 3
+        config["purge_days"] = 1
+        config["min_train_days"] = 7
     config_hash = _hash_text(_stable_json(config))
     train_hash = _sha256_file(train_path)
     test_hash = _sha256_file(test_path)
@@ -752,11 +864,104 @@ def run_with_ledger(
             direct_cat_cols = [col for col in cat_cols if col in direct_feature_cols]
             direct_numeric_cols = [col for col in direct_feature_cols if col not in direct_cat_cols]
 
+            # Global model (trained on all markets) provides a stabilizing signal for local stackers.
+            global_train_x = train_df[direct_feature_cols].copy()
+            global_test_x = test_df[direct_feature_cols].copy()
+
+            global_num_fill = {col: float(global_train_x[col].median()) for col in direct_numeric_cols}
+            for col, fill_val in global_num_fill.items():
+                global_train_x[col] = global_train_x[col].fillna(fill_val)
+                global_test_x[col] = global_test_x[col].fillna(fill_val)
+            for col in direct_cat_cols:
+                global_train_x[col] = global_train_x[col].fillna("missing").astype(str)
+                global_test_x[col] = global_test_x[col].fillna("missing").astype(str)
+
+            global_oof = np.full(len(train_df), np.nan, dtype=float)
+            global_folds = make_market_day_folds(
+                market_df=train_df,
+                n_splits=int(config["n_splits"]),
+                purge_days=int(config["purge_days"]),
+                min_train_days=int(config["min_train_days"]),
+            )
+            if len(global_folds) < 2:
+                raise ValueError("Global model requires at least 2 CV folds.")
+            global_fold_iterations = 700 if bool(config["fast_dev"]) else 1600
+            global_fold_es_rounds = 80 if bool(config["fast_dev"]) else 150
+
+            for fold_id, (g_train_idx, g_valid_idx) in enumerate(global_folds, start=1):
+                global_device_params: dict[str, str] = {}
+                if bool(config["use_gpu"]):
+                    global_device_params = {
+                        "task_type": "GPU",
+                        "devices": str(config["gpu_devices"]),
+                    }
+                global_model = CatBoostRegressor(
+                    loss_function="RMSE",
+                    eval_metric="RMSE",
+                    iterations=global_fold_iterations,
+                    learning_rate=0.03,
+                    depth=8,
+                    l2_leaf_reg=24,
+                    bagging_temperature=0.5,
+                    random_strength=0.8,
+                    random_seed=int(config["base_seed"]) + fold_id + 500,
+                    verbose=0,
+                    **global_device_params,
+                )
+                global_model.fit(
+                    global_train_x.iloc[g_train_idx],
+                    train_df["target"].iloc[g_train_idx],
+                    cat_features=direct_cat_cols,
+                    eval_set=(global_train_x.iloc[g_valid_idx], train_df["target"].iloc[g_valid_idx]),
+                    use_best_model=True,
+                    early_stopping_rounds=global_fold_es_rounds,
+                )
+                global_oof[g_valid_idx] = np.asarray(global_model.predict(global_train_x.iloc[g_valid_idx]), dtype=float)
+
+            global_valid_cov = float(np.mean(~np.isnan(global_oof)))
+            print(f"Global OOF coverage: {global_valid_cov * 100:.2f}%")
+            if global_valid_cov < 0.70:
+                print(
+                    "Warning: low global OOF coverage. "
+                    "Missing rows will use neutral global_delta=0 in the stacker."
+                )
+
+            final_global_device_params: dict[str, str] = {}
+            if bool(config["use_gpu"]):
+                final_global_device_params = {
+                    "task_type": "GPU",
+                    "devices": str(config["gpu_devices"]),
+                }
+
+            final_global_model = CatBoostRegressor(
+                loss_function="RMSE",
+                eval_metric="RMSE",
+                iterations=900 if bool(config["fast_dev"]) else 2000,
+                learning_rate=0.028,
+                depth=8,
+                l2_leaf_reg=26,
+                bagging_temperature=0.5,
+                random_strength=0.8,
+                random_seed=int(config["final_seed"]) + 800,
+                verbose=0,
+                **final_global_device_params,
+            )
+            final_global_model.fit(
+                global_train_x,
+                train_df["target"],
+                cat_features=direct_cat_cols,
+            )
+            global_test_pred = np.asarray(final_global_model.predict(global_test_x), dtype=float)
+            global_oof_by_id = dict(zip(train_df["id"].astype(int).tolist(), global_oof.tolist()))
+            global_test_pred_by_id = dict(zip(test_df["id"].astype(int).tolist(), global_test_pred.tolist()))
+
             print(f"Run ID: {run_id}")
             print(f"CatBoost device: {'GPU' if bool(config['use_gpu']) else 'CPU'} (devices={config['gpu_devices']})")
+            print(f"Run mode: {'FAST_DEV' if bool(config['fast_dev']) else 'FULL'}")
             print(f"Using {len(feature_cols)} features total")
             print(f"Categorical ({len(cat_cols)}): {cat_cols}")
             print(f"Inference mode: recursive first {int(config['recursive_steps'])} steps, then direct")
+            print("Blending mode: residual baseline + OOF stacker + global/local signal")
 
             predictions_by_id: dict[int, float] = {}
             market_scores: list[tuple[str, float]] = []
@@ -789,9 +994,14 @@ def run_with_ledger(
                     continue
 
                 y_all = market_train["target"].copy()
-                oof_cat = np.full(len(market_train), np.nan, dtype=float)
+                oof_baseline = np.full(len(market_train), np.nan, dtype=float)
+                oof_cat_normal = np.full(len(market_train), np.nan, dtype=float)
+                oof_cat_spike = np.full(len(market_train), np.nan, dtype=float)
                 oof_hgb = np.full(len(market_train), np.nan, dtype=float)
+                oof_p_spike = np.full(len(market_train), np.nan, dtype=float)
+                oof_global_delta = np.full(len(market_train), np.nan, dtype=float)
                 fold_records: list[dict[str, float | int]] = []
+                global_market_oof = market_train["id"].astype(int).map(global_oof_by_id).to_numpy(dtype=float)
 
                 for fold_id, (train_idx, valid_idx) in enumerate(folds, start=1):
                     x_train = market_train.iloc[train_idx][feature_cols].copy()
@@ -799,49 +1009,82 @@ def run_with_ledger(
                     x_valid = market_train.iloc[valid_idx][feature_cols].copy()
                     y_valid = y_all.iloc[valid_idx]
 
-                    models, valid_outputs = _fit_market_models(
+                    baseline_model_fold = _fit_ridge_baseline(
                         x_train=x_train,
                         y_train=y_train,
+                        numeric_cols=direct_numeric_cols,
+                    )
+                    baseline_train = _predict_baseline(baseline_model_fold, x_train)
+                    baseline_valid = _predict_baseline(baseline_model_fold, x_valid)
+                    y_train_residual = y_train.to_numpy(dtype=float) - baseline_train
+                    y_valid_residual = y_valid.to_numpy(dtype=float) - baseline_valid
+
+                    models, valid_outputs = _fit_market_models(
+                        x_train=x_train,
+                        y_train=pd.Series(y_train_residual, index=y_train.index),
                         x_valid=x_valid,
-                        y_valid=y_valid,
+                        y_valid=pd.Series(y_valid_residual, index=y_valid.index),
                         cat_cols=cat_cols,
                         numeric_cols=numeric_cols,
                         seed=int(config["base_seed"]) + fold_id,
                         use_gpu=bool(config["use_gpu"]),
                         gpu_devices=str(config["gpu_devices"]),
+                        fast_dev=bool(config["fast_dev"]),
                     )
 
-                    cat_pred = np.asarray(valid_outputs["cat_regime"], dtype=float)
+                    cat_normal_pred = np.asarray(valid_outputs["cat_normal"], dtype=float)
+                    cat_spike_pred = np.asarray(valid_outputs["cat_spike"], dtype=float)
                     hgb_pred = np.asarray(valid_outputs["hgb"], dtype=float)
+                    p_spike_pred = np.asarray(valid_outputs["p_spike"], dtype=float)
 
-                    oof_cat[valid_idx] = cat_pred
+                    oof_baseline[valid_idx] = baseline_valid
+                    oof_cat_normal[valid_idx] = cat_normal_pred
+                    oof_cat_spike[valid_idx] = cat_spike_pred
                     oof_hgb[valid_idx] = hgb_pred
+                    oof_p_spike[valid_idx] = p_spike_pred
+                    oof_global_delta[valid_idx] = np.nan_to_num(global_market_oof[valid_idx] - baseline_valid, nan=0.0)
 
-                    rmse_cat = float(mean_squared_error(y_valid, cat_pred) ** 0.5)
-                    rmse_hgb = float(mean_squared_error(y_valid, hgb_pred) ** 0.5)
+                    fold_blend = baseline_valid + (
+                        0.5 * (p_spike_pred * cat_spike_pred + (1.0 - p_spike_pred) * cat_normal_pred)
+                        + 0.5 * hgb_pred
+                    )
+                    rmse_fold = float(mean_squared_error(y_valid, fold_blend) ** 0.5)
                     fold_records.append(
                         {
                             "fold": fold_id,
-                            "rmse_cat": rmse_cat,
-                            "rmse_hgb": rmse_hgb,
+                            "rmse_fold": rmse_fold,
                         }
                     )
-                    print(f"{market} | Fold {fold_id}/{len(folds)} | RMSE cat={rmse_cat:.6f}, hgb={rmse_hgb:.6f}")
+                    print(f"{market} | Fold {fold_id}/{len(folds)} | Residual blend RMSE={rmse_fold:.6f}")
 
-                valid_mask = (~np.isnan(oof_cat)) & (~np.isnan(oof_hgb))
+                valid_mask = (
+                    (~np.isnan(oof_baseline))
+                    & (~np.isnan(oof_cat_normal))
+                    & (~np.isnan(oof_cat_spike))
+                    & (~np.isnan(oof_hgb))
+                    & (~np.isnan(oof_p_spike))
+                )
                 if not np.any(valid_mask):
                     continue
 
-                recent = sorted(fold_records, key=lambda x: int(x["fold"]))[-2:]
-                cat_recent_rmse = float(np.mean([float(record["rmse_cat"]) for record in recent]))
-                hgb_recent_rmse = float(np.mean([float(record["rmse_hgb"]) for record in recent]))
+                meta_x = _build_meta_matrix(
+                    cat_normal=oof_cat_normal[valid_mask],
+                    cat_spike=oof_cat_spike[valid_mask],
+                    hgb=oof_hgb[valid_mask],
+                    p_spike=oof_p_spike[valid_mask],
+                    global_delta=np.nan_to_num(oof_global_delta[valid_mask], nan=0.0),
+                    hour=market_train.loc[valid_mask, "delivery_start_hour"].to_numpy(dtype=float),
+                    dow=market_train.loc[valid_mask, "delivery_start_dow"].to_numpy(dtype=float),
+                )
+                y_residual_target = y_all[valid_mask].to_numpy(dtype=float) - oof_baseline[valid_mask]
+                stacker = make_pipeline(
+                    StandardScaler(),
+                    Ridge(alpha=20.0, solver="svd"),
+                )
+                stacker.fit(meta_x, y_residual_target)
 
-                inv_cat = 1.0 / (cat_recent_rmse + 1e-9)
-                inv_hgb = 1.0 / (hgb_recent_rmse + 1e-9)
-                cat_weight = inv_cat / (inv_cat + inv_hgb)
-                hgb_weight = inv_hgb / (inv_cat + inv_hgb)
-
-                oof_blend = cat_weight * oof_cat[valid_mask] + hgb_weight * oof_hgb[valid_mask]
+                oof_residual = stacker.predict(meta_x)
+                oof_blend = oof_baseline[valid_mask] + oof_residual
                 market_oof_rmse = float(mean_squared_error(y_all[valid_mask], oof_blend) ** 0.5)
                 market_scores.append((market, market_oof_rmse))
 
@@ -866,35 +1109,44 @@ def run_with_ledger(
 
                 x_full = market_train[feature_cols].copy()
                 y_full = y_all.copy()
+                baseline_full = _fit_ridge_baseline(
+                    x_train=x_full,
+                    y_train=y_full,
+                    numeric_cols=direct_numeric_cols,
+                )
 
                 holdout_size = max(24, int(len(market_train) * 0.1))
                 x_fit = x_full.iloc[:-holdout_size]
                 y_fit = y_full.iloc[:-holdout_size]
                 x_cal = x_full.iloc[-holdout_size:]
                 y_cal = y_full.iloc[-holdout_size:]
+                baseline_fit = _predict_baseline(baseline_full, x_fit)
+                baseline_cal = _predict_baseline(baseline_full, x_cal)
 
                 final_models, _ = _fit_market_models(
                     x_train=x_fit,
-                    y_train=y_fit,
+                    y_train=pd.Series(y_fit.to_numpy(dtype=float) - baseline_fit, index=y_fit.index),
                     x_valid=x_cal,
-                    y_valid=y_cal,
+                    y_valid=pd.Series(y_cal.to_numpy(dtype=float) - baseline_cal, index=y_cal.index),
                     cat_cols=cat_cols,
                     numeric_cols=numeric_cols,
                     seed=int(config["final_seed"]),
                     use_gpu=bool(config["use_gpu"]),
                     gpu_devices=str(config["gpu_devices"]),
+                    fast_dev=bool(config["fast_dev"]),
                 )
 
                 final_direct_models, _ = _fit_market_models(
                     x_train=x_fit[direct_feature_cols],
-                    y_train=y_fit,
+                    y_train=pd.Series(y_fit.to_numpy(dtype=float) - baseline_fit, index=y_fit.index),
                     x_valid=x_cal[direct_feature_cols],
-                    y_valid=y_cal,
+                    y_valid=pd.Series(y_cal.to_numpy(dtype=float) - baseline_cal, index=y_cal.index),
                     cat_cols=direct_cat_cols,
                     numeric_cols=direct_numeric_cols,
                     seed=int(config["final_seed"]) + 37,
                     use_gpu=bool(config["use_gpu"]),
                     gpu_devices=str(config["gpu_devices"]),
+                    fast_dev=bool(config["fast_dev"]),
                 )
 
                 num_fill_values = {col: float(market_train[col].median()) for col in numeric_cols}
@@ -913,8 +1165,9 @@ def run_with_ledger(
                     history_targets=history_targets,
                     recursive_models=final_models,
                     direct_models=final_direct_models,
-                    cat_weight=cat_weight,
-                    hgb_weight=hgb_weight,
+                    stacker=stacker,
+                    baseline_model=baseline_full,
+                    global_test_pred_by_id=global_test_pred_by_id,
                     recursive_steps=int(config["recursive_steps"]),
                 )
 
@@ -928,11 +1181,16 @@ def run_with_ledger(
                     test_id = int(market_test.iloc[i]["id"])
                     predictions_by_id[test_id] = float(pred)
 
+                stacker_ridge: Ridge = stacker.named_steps["ridge"]  # type: ignore[index]
+                stacker_coef = np.asarray(stacker_ridge.coef_, dtype=float)
                 model_manifest_rows.append(
-                    f"market={market}, oof_rmse={market_oof_rmse:.6f}, cat_weight={cat_weight:.4f}, hgb_weight={hgb_weight:.4f}"
+                    "market="
+                    f"{market}, oof_rmse={market_oof_rmse:.6f}, "
+                    f"stacker_intercept={float(stacker_ridge.intercept_):.6f}, "
+                    f"stacker_coef={','.join(f'{c:.6f}' for c in stacker_coef.tolist())}"
                 )
                 print(
-                    f"{market} | OOF RMSE={market_oof_rmse:.6f} | recent-blend weights: cat={cat_weight:.3f}, hgb={hgb_weight:.3f}"
+                    f"{market} | OOF RMSE={market_oof_rmse:.6f} | learned stacker with {len(stacker_coef)} features"
                 )
 
             submission = sample_submission[["id"]].copy()
@@ -1029,6 +1287,11 @@ def main() -> None:
         help="Optional leaderboard score to include at run time.",
     )
     parser.add_argument(
+        "--fast-dev",
+        action="store_true",
+        help="Run a much faster development profile (fewer folds and lighter models).",
+    )
+    parser.add_argument(
         "--exclude-2023",
         action="store_true",
         help="Exclude all training observations where delivery_start year is 2023.",
@@ -1048,6 +1311,7 @@ def main() -> None:
         config_name=args.config_name,
         official_run=args.official_run,
         lb_score=args.lb_score,
+        fast_dev=args.fast_dev,
         exclude_2023=args.exclude_2023,
         use_gpu=args.use_gpu,
         gpu_devices=args.gpu_devices,

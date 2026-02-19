@@ -1,0 +1,59 @@
+Excluded 2023 observations from training: removed 44924 rows
+Run ID: 20260219-1705_92239c7_per_market_v1
+CatBoost device: CPU (devices=0)
+Using 80 features total
+Categorical (1): ['month_x_market']
+Inference mode: recursive first 12 steps, then direct
+Market A | Fold 1/5 | RMSE cat=85.786714, hgb=82.304625
+Market A | Fold 2/5 | RMSE cat=65.740462, hgb=65.328820
+Market A | Fold 3/5 | RMSE cat=70.407479, hgb=68.364985
+Market A | Fold 4/5 | RMSE cat=47.883405, hgb=57.151170
+Market A | Fold 5/5 | RMSE cat=48.208601, hgb=50.993174
+Market A | OOF RMSE=64.156982 | recent-blend weights: cat=0.530, hgb=0.470
+Market B | Fold 1/5 | RMSE cat=88.537498, hgb=86.680854
+Market B | Fold 2/5 | RMSE cat=66.573918, hgb=62.944950
+Market B | Fold 3/5 | RMSE cat=59.409411, hgb=63.207634
+Market B | Fold 4/5 | RMSE cat=40.757697, hgb=55.492476
+Market B | Fold 5/5 | RMSE cat=16.835265, hgb=18.095075
+Market B | OOF RMSE=59.067782 | recent-blend weights: cat=0.561, hgb=0.439
+Market C | Fold 1/5 | RMSE cat=87.740641, hgb=85.501205
+Market C | Fold 2/5 | RMSE cat=67.727153, hgb=66.535598
+Market C | Fold 3/5 | RMSE cat=26.448990, hgb=30.458945
+Market C | Fold 4/5 | RMSE cat=30.386761, hgb=38.730737
+Market C | Fold 5/5 | RMSE cat=15.410723, hgb=16.180364
+Market C | OOF RMSE=52.619638 | recent-blend weights: cat=0.545, hgb=0.455
+Market D | Fold 1/5 | RMSE cat=235.064587, hgb=235.841614
+Market D | Fold 2/5 | RMSE cat=70.724133, hgb=71.310635
+Market D | Fold 3/5 | RMSE cat=24.296352, hgb=34.919488
+Market D | Fold 4/5 | RMSE cat=33.236056, hgb=57.688762
+Market D | Fold 5/5 | RMSE cat=18.625750, hgb=23.807056
+Market D | OOF RMSE=111.843428 | recent-blend weights: cat=0.611, hgb=0.389
+Market E | Fold 1/5 | RMSE cat=87.431529, hgb=84.520371
+Market E | Fold 2/5 | RMSE cat=70.947101, hgb=66.023187
+Market E | Fold 3/5 | RMSE cat=61.123520, hgb=66.185346
+Market E | Fold 4/5 | RMSE cat=41.429826, hgb=57.723397
+Market E | Fold 5/5 | RMSE cat=16.198188, hgb=18.215702
+Market E | OOF RMSE=59.617188 | recent-blend weights: cat=0.569, hgb=0.431
+Market F | Fold 1/5 | RMSE cat=111.517881, hgb=108.269494
+Market F | Fold 2/5 | RMSE cat=63.368132, hgb=63.949778
+Market F | Fold 3/5 | RMSE cat=25.356384, hgb=27.494548
+Market F | Fold 4/5 | RMSE cat=30.842876, hgb=31.750081
+Market F | Fold 5/5 | RMSE cat=13.467969, hgb=14.979004
+Market F | OOF RMSE=59.456521 | recent-blend weights: cat=0.513, hgb=0.487
+Per-market CV RMSE (day folds):
+  Market C: 52.619638
+  Market B: 59.067782
+  Market F: 59.456521
+  Market E: 59.617188
+  Market A: 64.156982
+  Market D: 111.843428
+Mean per-market RMSE: 67.793590
+       id      target
+0  133627  253.757571
+1  133629   26.966505
+2  133630   28.370092
+3  133631   25.412277
+4  133633   28.977446
+Saved run artifacts under: /Users/simonbisgaard/Desktop/nitor/runs/20260219-1705_92239c7_per_market_v1
+Saved latest submission copy: /Users/simonbisgaard/Desktop/nitor/submission_per_market.csv
+Registry updated: /Users/simonbisgaard/Desktop/nitor/experiments.csv

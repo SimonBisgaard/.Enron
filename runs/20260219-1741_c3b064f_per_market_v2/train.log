@@ -1,0 +1,61 @@
+Excluded 2023 observations from training: removed 44924 rows
+Global OOF coverage: 82.93%
+Run ID: 20260219-1741_c3b064f_per_market_v2
+CatBoost device: CPU (devices=0)
+Using 80 features total
+Categorical (1): ['month_x_market']
+Inference mode: recursive first 12 steps, then direct
+Blending mode: residual baseline + OOF stacker + global/local signal
+Market A | Fold 1/5 | Residual blend RMSE=92.294459
+Market A | Fold 2/5 | Residual blend RMSE=74.955287
+Market A | Fold 3/5 | Residual blend RMSE=70.391478
+Market A | Fold 4/5 | Residual blend RMSE=52.606897
+Market A | Fold 5/5 | Residual blend RMSE=51.743729
+Market A | OOF RMSE=65.558508 | learned stacker with 8 features
+Market B | Fold 1/5 | Residual blend RMSE=88.150249
+Market B | Fold 2/5 | Residual blend RMSE=66.292402
+Market B | Fold 3/5 | Residual blend RMSE=65.374588
+Market B | Fold 4/5 | Residual blend RMSE=44.075057
+Market B | Fold 5/5 | Residual blend RMSE=19.646183
+Market B | OOF RMSE=58.260040 | learned stacker with 8 features
+Market C | Fold 1/5 | Residual blend RMSE=89.351262
+Market C | Fold 2/5 | Residual blend RMSE=77.639809
+Market C | Fold 3/5 | Residual blend RMSE=27.989401
+Market C | Fold 4/5 | Residual blend RMSE=35.326245
+Market C | Fold 5/5 | Residual blend RMSE=18.814375
+Market C | OOF RMSE=53.794925 | learned stacker with 8 features
+Market D | Fold 1/5 | Residual blend RMSE=240.508644
+Market D | Fold 2/5 | Residual blend RMSE=96.324362
+Market D | Fold 3/5 | Residual blend RMSE=34.298961
+Market D | Fold 4/5 | Residual blend RMSE=52.740873
+Market D | Fold 5/5 | Residual blend RMSE=23.087559
+Market D | OOF RMSE=112.595919 | learned stacker with 8 features
+Market E | Fold 1/5 | Residual blend RMSE=86.510729
+Market E | Fold 2/5 | Residual blend RMSE=69.243326
+Market E | Fold 3/5 | Residual blend RMSE=62.465439
+Market E | Fold 4/5 | Residual blend RMSE=44.597528
+Market E | Fold 5/5 | Residual blend RMSE=19.777593
+Market E | OOF RMSE=58.745687 | learned stacker with 8 features
+Market F | Fold 1/5 | Residual blend RMSE=112.705833
+Market F | Fold 2/5 | Residual blend RMSE=66.471709
+Market F | Fold 3/5 | Residual blend RMSE=28.836997
+Market F | Fold 4/5 | Residual blend RMSE=32.745036
+Market F | Fold 5/5 | Residual blend RMSE=14.137625
+Market F | OOF RMSE=60.170916 | learned stacker with 8 features
+Per-market CV RMSE (day folds):
+  Market C: 53.794925
+  Market B: 58.260040
+  Market E: 58.745687
+  Market F: 60.170916
+  Market A: 65.558508
+  Market D: 112.595919
+Mean per-market RMSE: 68.187666
+       id      target
+0  133627  393.008075
+1  133629   25.427924
+2  133630   25.646618
+3  133631   23.979245
+4  133633   22.887274
+Saved run artifacts under: /Users/simonbisgaard/Desktop/nitor/runs/20260219-1741_c3b064f_per_market_v2
+Saved latest submission copy: /Users/simonbisgaard/Desktop/nitor/submission_per_market.csv
+Registry updated: /Users/simonbisgaard/Desktop/nitor/experiments.csv

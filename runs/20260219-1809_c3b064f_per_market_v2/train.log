@@ -1,0 +1,50 @@
+Excluded 2023 observations from training: removed 44924 rows
+Global OOF coverage: 74.88%
+Run ID: 20260219-1809_c3b064f_per_market_v2
+CatBoost device: CPU (devices=0)
+Run mode: FAST_DEV
+Using 80 features total
+Categorical (1): ['month_x_market']
+Inference mode: recursive first 6 steps, then direct
+Blending mode: residual baseline + OOF stacker + global/local signal
+Market A | Fold 1/3 | Residual blend RMSE=91.717381
+Market A | Fold 2/3 | Residual blend RMSE=62.046976
+Market A | Fold 3/3 | Residual blend RMSE=56.178060
+Market A | OOF RMSE=59.319670 | learned stacker with 8 features
+Market B | Fold 1/3 | Residual blend RMSE=59.138496
+Market B | Fold 2/3 | Residual blend RMSE=63.421019
+Market B | Fold 3/3 | Residual blend RMSE=36.216496
+Market B | OOF RMSE=50.265017 | learned stacker with 8 features
+Market C | Fold 1/3 | Residual blend RMSE=106.760022
+Market C | Fold 2/3 | Residual blend RMSE=25.870277
+Market C | Fold 3/3 | Residual blend RMSE=28.238246
+Market C | OOF RMSE=42.957173 | learned stacker with 8 features
+Market D | Fold 1/3 | Residual blend RMSE=100.976566
+Market D | Fold 2/3 | Residual blend RMSE=38.698535
+Market D | Fold 3/3 | Residual blend RMSE=34.156852
+Market D | OOF RMSE=50.577165 | learned stacker with 8 features
+Market E | Fold 1/3 | Residual blend RMSE=58.994367
+Market E | Fold 2/3 | Residual blend RMSE=52.997666
+Market E | Fold 3/3 | Residual blend RMSE=35.989118
+Market E | OOF RMSE=48.596649 | learned stacker with 8 features
+Market F | Fold 1/3 | Residual blend RMSE=64.285497
+Market F | Fold 2/3 | Residual blend RMSE=27.433143
+Market F | Fold 3/3 | Residual blend RMSE=28.264900
+Market F | OOF RMSE=39.892199 | learned stacker with 8 features
+Per-market CV RMSE (day folds):
+  Market F: 39.892199
+  Market C: 42.957173
+  Market E: 48.596649
+  Market B: 50.265017
+  Market D: 50.577165
+  Market A: 59.319670
+Mean per-market RMSE: 48.601312
+       id      target
+0  133627  404.618368
+1  133629   27.524190
+2  133630   34.114830
+3  133631   30.948654
+4  133633   26.034948
+Saved run artifacts under: /Users/simonbisgaard/Desktop/nitor/runs/20260219-1809_c3b064f_per_market_v2
+Saved latest submission copy: /Users/simonbisgaard/Desktop/nitor/submission_per_market.csv
+Registry updated: /Users/simonbisgaard/Desktop/nitor/experiments.csv

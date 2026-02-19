@@ -1,0 +1,25 @@
+Excluded 2023 observations from training: removed 44924 rows
+Global OOF coverage: 82.93%
+Run ID: 20260219-1735_c3b064f_per_market_v2
+CatBoost device: CPU (devices=0)
+Using 80 features total
+Categorical (1): ['month_x_market']
+Inference mode: recursive first 12 steps, then direct
+Blending mode: residual baseline + OOF stacker + global/local signal
+/Users/simonbisgaard/Desktop/nitor/.venv/lib/python3.13/site-packages/sklearn/linear_model/_ridge.py:228: LinAlgWarning: An ill-conditioned matrix detected: slice 0 has rcond = 3.628122621031157e-17.
+  return linalg.solve(A, Xy, assume_a="pos", overwrite_a=True).T
+Market A | Fold 1/5 | Residual blend RMSE=92.628859
+/Users/simonbisgaard/Desktop/nitor/.venv/lib/python3.13/site-packages/sklearn/linear_model/_ridge.py:228: LinAlgWarning: An ill-conditioned matrix detected: slice 0 has rcond = 4.564840928176082e-18.
+  return linalg.solve(A, Xy, assume_a="pos", overwrite_a=True).T
+Market A | Fold 2/5 | Residual blend RMSE=79.678049
+/Users/simonbisgaard/Desktop/nitor/.venv/lib/python3.13/site-packages/sklearn/linear_model/_ridge.py:228: LinAlgWarning: An ill-conditioned matrix detected: slice 0 has rcond = 1.3540346716389385e-18.
+  return linalg.solve(A, Xy, assume_a="pos", overwrite_a=True).T
+Market A | Fold 3/5 | Residual blend RMSE=770.111770
+/Users/simonbisgaard/Desktop/nitor/.venv/lib/python3.13/site-packages/sklearn/linear_model/_ridge.py:228: LinAlgWarning: An ill-conditioned matrix detected: slice 0 has rcond = 5.822316253801593e-19.
+  return linalg.solve(A, Xy, assume_a="pos", overwrite_a=True).T
+Market A | Fold 4/5 | Residual blend RMSE=53.142933
+/Users/simonbisgaard/Desktop/nitor/.venv/lib/python3.13/site-packages/sklearn/linear_model/_ridge.py:228: LinAlgWarning: An ill-conditioned matrix detected: slice 0 has rcond = 2.982955679097464e-19.
+  return linalg.solve(A, Xy, assume_a="pos", overwrite_a=True).T
+Market A | Fold 5/5 | Residual blend RMSE=53.052576
+/Users/simonbisgaard/Desktop/nitor/.venv/lib/python3.13/site-packages/sklearn/linear_model/_ridge.py:228: LinAlgWarning: An ill-conditioned matrix detected: slice 0 has rcond = 1.7001434687750566e-19.
+  return linalg.solve(A, Xy, assume_a="pos", overwrite_a=True).T

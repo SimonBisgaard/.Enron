@@ -1,0 +1,55 @@
+{
+  "config": {
+    "base_seed": 42,
+    "config_name": "per_market_v2",
+    "correction_alpha": 0.6,
+    "exclude_2023": true,
+    "fast_dev": true,
+    "final_seed": 999,
+    "gpu_devices": "0",
+    "min_market_rows": 400,
+    "min_train_days": 7,
+    "n_splits": 3,
+    "purge_days": 1,
+    "recursive_steps": 6,
+    "use_gpu": false
+  },
+  "config_hash": "4e770fac0d803442cef22757dbde07198eed90a51fc727d1541598ba56d325a9",
+  "cv_rmse": 48.99283196487612,
+  "data_hash": "d5d1c3bfcb4b55a8161356b389073d4eb23cae10fbb5f28f06ddbbdee1211ace",
+  "dirty_repo": true,
+  "git_branch": "main",
+  "git_sha": "c3b064f",
+  "lb_score": null,
+  "market_scores": [
+    {
+      "market": "Market A",
+      "rmse": 59.31967038909006
+    },
+    {
+      "market": "Market B",
+      "rmse": 50.26501713894891
+    },
+    {
+      "market": "Market C",
+      "rmse": 42.957173263063005
+    },
+    {
+      "market": "Market D",
+      "rmse": 50.577165328809755
+    },
+    {
+      "market": "Market E",
+      "rmse": 48.59664941336723
+    },
+    {
+      "market": "Market F",
+      "rmse": 39.89219897330945
+    }
+  ],
+  "model_path": "/Users/simonbisgaard/Desktop/nitor/runs/20260219-1809_c3b064f_per_market_v2/models_manifest.txt",
+  "oof_path": "/Users/simonbisgaard/Desktop/nitor/runs/20260219-1809_c3b064f_per_market_v2/oof.csv",
+  "run_id": "20260219-1809_c3b064f_per_market_v2",
+  "started_at": "2026-02-19T17:09:34.188526+00:00",
+  "submission_path": "/Users/simonbisgaard/Desktop/nitor/runs/20260219-1809_c3b064f_per_market_v2/submission.csv"
+}

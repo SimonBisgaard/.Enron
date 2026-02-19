@@ -71,6 +71,101 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return result.drop(columns=["delivery_start", "delivery_end"])
 
 
+def add_residual_load_features(train_df: pd.DataFrame, test_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    train_res = train_df.copy()
+    test_res = test_df.copy()
+
+    demand_col = "demand_forecast" if "demand_forecast" in train_res.columns else "load_forecast"
+    required = {demand_col, "wind_forecast", "solar_forecast"}
+    if not required.issubset(train_res.columns) or not required.issubset(test_res.columns):
+        return train_res, test_res
+
+    train_res["residual_load"] = (
+        train_res[demand_col].astype(float) - train_res["wind_forecast"].astype(float) - train_res["solar_forecast"].astype(float)
+    )
+    test_res["residual_load"] = (
+        test_res[demand_col].astype(float) - test_res["wind_forecast"].astype(float) - test_res["solar_forecast"].astype(float)
+    )
+
+    train_res = train_res.sort_values(["market", "delivery_start_ts", "id"]).reset_index(drop=True)
+    test_res = test_res.sort_values(["market", "delivery_start_ts", "id"]).reset_index(drop=True)
+
+    train_res["residual_load_pctl"] = np.nan
+    test_res["residual_load_pctl"] = np.nan
+    train_res["residual_load_bin10"] = np.nan
+    test_res["residual_load_bin10"] = np.nan
+    train_res["residual_load_z"] = np.nan
+    test_res["residual_load_z"] = np.nan
+
+    for market in sorted(train_res["market"].dropna().unique()):
+        train_mask = train_res["market"] == market
+        test_mask = test_res["market"] == market
+
+        train_vals = train_res.loc[train_mask, "residual_load"].to_numpy(dtype=float)
+        if len(train_vals) == 0:
+            continue
+
+        sorted_vals = np.sort(train_vals)
+        denom = max(len(sorted_vals) - 1, 1)
+
+        def empirical_percentile(values: np.ndarray) -> np.ndarray:
+            left = np.searchsorted(sorted_vals, values, side="left")
+            right = np.searchsorted(sorted_vals, values, side="right")
+            rank = 0.5 * (left + right)
+            return rank / denom
+
+        train_pct = empirical_percentile(train_vals)
+        train_res.loc[train_mask, "residual_load_pctl"] = train_pct
+
+        if test_mask.any():
+            test_vals = test_res.loc[test_mask, "residual_load"].to_numpy(dtype=float)
+            test_res.loc[test_mask, "residual_load_pctl"] = empirical_percentile(test_vals)
+
+        quantile_edges = np.quantile(sorted_vals, np.linspace(0.0, 1.0, 11))
+        quantile_edges = np.unique(quantile_edges)
+        if len(quantile_edges) > 1:
+            train_bins = pd.cut(train_res.loc[train_mask, "residual_load"], bins=quantile_edges, labels=False, include_lowest=True)
+            test_bins = pd.cut(test_res.loc[test_mask, "residual_load"], bins=quantile_edges, labels=False, include_lowest=True)
+            train_res.loc[train_mask, "residual_load_bin10"] = train_bins.astype(float)
+            test_res.loc[test_mask, "residual_load_bin10"] = test_bins.astype(float)
+
+        mean_val = float(np.mean(train_vals))
+        std_val = float(np.std(train_vals))
+        std_val = std_val if std_val > 1e-9 else 1.0
+        train_res.loc[train_mask, "residual_load_z"] = (train_res.loc[train_mask, "residual_load"] - mean_val) / std_val
+        if test_mask.any():
+            test_res.loc[test_mask, "residual_load_z"] = (test_res.loc[test_mask, "residual_load"] - mean_val) / std_val
+
+    train_res["is_high_residual"] = (train_res["residual_load_pctl"] >= 0.80).astype(int)
+    test_res["is_high_residual"] = (test_res["residual_load_pctl"] >= 0.80).astype(int)
+
+    comb_train = train_res.copy()
+    comb_test = test_res.copy()
+    comb_train["__is_train"] = 1
+    comb_test["__is_train"] = 0
+    combined = pd.concat([comb_train, comb_test], ignore_index=True, sort=False)
+    combined = combined.sort_values(["market", "delivery_start_ts", "id"]).reset_index(drop=True)
+
+    grouped = combined.groupby("market", sort=False)
+    combined["residual_load_lag1"] = grouped["residual_load"].shift(1)
+    combined["residual_load_lag24"] = grouped["residual_load"].shift(24)
+    combined["residual_load_delta_1"] = combined["residual_load"] - combined["residual_load_lag1"]
+    combined["residual_load_delta_24"] = combined["residual_load"] - combined["residual_load_lag24"]
+
+    residual_lag1 = grouped["residual_load"].shift(1)
+    combined["residual_load_rollmean_30d"] = (
+        residual_lag1.groupby(combined["market"]).rolling(30 * 24, min_periods=24).mean().reset_index(level=0, drop=True)
+    )
+    combined["residual_load_vs_30d"] = combined["residual_load"] - combined["residual_load_rollmean_30d"]
+
+    train_out = combined.loc[combined["__is_train"] == 1].drop(columns=["__is_train"]).copy()
+    test_out = combined.loc[combined["__is_train"] == 0].drop(columns=["__is_train"]).copy()
+
+    train_out = train_out.sort_values(["delivery_start_ts", "market", "id"]).reset_index(drop=True)
+    test_out = test_out.sort_values(["delivery_start_ts", "market", "id"]).reset_index(drop=True)
+    return train_out, test_out
+
+
 def add_train_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy().sort_values(["market", "delivery_start_ts", "id"]).reset_index(drop=True)
     grouped = result.groupby("market", sort=False)
@@ -116,34 +211,36 @@ def add_test_base_features(df: pd.DataFrame) -> pd.DataFrame:
     return result.sort_values(["delivery_start_ts", "market", "id"]).reset_index(drop=True)
 
 
-def make_market_timestamp_folds(
+def make_market_day_folds(
     market_df: pd.DataFrame,
     n_splits: int,
-    purge_timestamps: int,
-    min_train_timestamps: int,
+    purge_days: int,
+    min_train_days: int,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    unique_ts = np.array(sorted(market_df["delivery_start_ts"].unique()))
-    if len(unique_ts) < (n_splits + 2):
+    day_series = pd.to_datetime(market_df["delivery_start_ts"], unit="s", errors="coerce").dt.floor("D")
+    unique_days = np.array(sorted(day_series.dropna().unique()))
+
+    if len(unique_days) < (n_splits + 2):
         return []
 
-    val_size = max(24, len(unique_ts) // (n_splits + 1))
+    val_size_days = max(2, len(unique_days) // (n_splits + 1))
     folds: list[tuple[np.ndarray, np.ndarray]] = []
 
     for fold in range(n_splits):
-        train_end = val_size * (fold + 1)
-        if train_end < min_train_timestamps:
+        train_end = val_size_days * (fold + 1)
+        if train_end < min_train_days:
             continue
 
-        valid_start = train_end + purge_timestamps
-        valid_end = min(valid_start + val_size, len(unique_ts))
+        valid_start = train_end + purge_days
+        valid_end = min(valid_start + val_size_days, len(unique_days))
         if valid_end <= valid_start:
             break
 
-        train_ts = unique_ts[:train_end]
-        valid_ts = unique_ts[valid_start:valid_end]
+        train_days = unique_days[:train_end]
+        valid_days = unique_days[valid_start:valid_end]
 
-        train_idx = market_df.index[market_df["delivery_start_ts"].isin(train_ts)].to_numpy()
-        valid_idx = market_df.index[market_df["delivery_start_ts"].isin(valid_ts)].to_numpy()
+        train_idx = market_df.index[day_series.isin(train_days)].to_numpy()
+        valid_idx = market_df.index[day_series.isin(valid_days)].to_numpy()
 
         if len(train_idx) == 0 or len(valid_idx) == 0:
             continue
@@ -368,6 +465,8 @@ def main() -> None:
     train_df = add_time_features(train_df)
     test_df = add_time_features(test_df)
 
+    train_df, test_df = add_residual_load_features(train_df, test_df)
+
     train_df = add_train_lag_features(train_df)
     test_df = add_test_base_features(test_df)
 
@@ -403,11 +502,11 @@ def main() -> None:
             market_train[col] = market_train[col].fillna("missing").astype(str)
             market_test[col] = market_test[col].fillna("missing").astype(str)
 
-        folds = make_market_timestamp_folds(
+        folds = make_market_day_folds(
             market_df=market_train,
             n_splits=5,
-            purge_timestamps=36,
-            min_train_timestamps=24 * 10,
+            purge_days=2,
+            min_train_days=10,
         )
         if len(folds) < 2:
             continue

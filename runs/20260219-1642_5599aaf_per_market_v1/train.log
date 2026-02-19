@@ -1,0 +1,8 @@
+Run ID: 20260219-1642_5599aaf_per_market_v1
+CatBoost device: CPU (devices=0)
+Using 80 features total
+Categorical (1): ['month_x_market']
+Inference mode: recursive first 12 steps, then direct
+Market A | Fold 1/5 | RMSE cat=314.324824, hgb=293.330566
+Market A | Fold 2/5 | RMSE cat=67.503262, hgb=85.646689
+Market A | Fold 3/5 | RMSE cat=60.221030, hgb=61.762156

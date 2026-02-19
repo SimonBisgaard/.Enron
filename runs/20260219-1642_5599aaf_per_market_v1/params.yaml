@@ -1,0 +1,20 @@
+run_id: "20260219-1642_5599aaf_per_market_v1"
+started_at: "2026-02-19T15:42:01.918977+00:00"
+git_sha: "5599aaf"
+git_branch: "main"
+dirty_repo: true
+data_hash: "d5d1c3bfcb4b55a8161356b389073d4eb23cae10fbb5f28f06ddbbdee1211ace"
+config_hash: "2d620e4faeee9106dd5a3e227c44d242329dbbd06a9089b3b3e17226498b0b30"
+config:
+  config_name: "per_market_v1"
+  exclude_2023: false
+  use_gpu: false
+  gpu_devices: "0"
+  recursive_steps: 12
+  n_splits: 5
+  purge_days: 2
+  min_train_days: 10
+  base_seed: 42
+  final_seed: 999
+  correction_alpha: 0.6
+  min_market_rows: 400

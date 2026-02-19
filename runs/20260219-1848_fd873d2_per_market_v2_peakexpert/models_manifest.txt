@@ -1,0 +1,6 @@
+market=Market A, oof_rmse=62.370632, fold_rmse_mean_last2=59.099157, fold_rmse_worst=90.888899, stacker_intercept=27.202106, stacker_coef=-16.870082,25.707573,47.372556,12.790244,-4.863874,2.149494,-9.365078
+market=Market B, oof_rmse=53.062120, fold_rmse_mean_last2=49.881458, fold_rmse_worst=63.125206, stacker_intercept=-1.617007, stacker_coef=11.271953,12.162348,-1.892619,9.605775,15.494655,-19.086048,2.242046
+market=Market C, oof_rmse=64.563671, fold_rmse_mean_last2=27.217901, fold_rmse_worst=106.436063, stacker_intercept=2.274391, stacker_coef=6.014726,6.396541,7.288340,10.564869,6.482402,-8.290887,-3.681726
+market=Market D, oof_rmse=59.875334, fold_rmse_mean_last2=35.957331, fold_rmse_worst=101.172782, stacker_intercept=-17.012842, stacker_coef=15.155717,5.200094,21.624384,16.875857,-0.910149,-26.601379,-12.559708
+market=Market E, oof_rmse=48.740571, fold_rmse_mean_last2=44.734988, fold_rmse_worst=59.312338, stacker_intercept=-3.389963, stacker_coef=8.676614,20.279878,-5.080583,10.321346,11.172934,-11.216645,2.888707
+market=Market F, oof_rmse=40.768492, fold_rmse_mean_last2=27.862434, fold_rmse_worst=63.313272, stacker_intercept=-5.257682, stacker_coef=6.568371,11.131776,19.600867,-3.504775,10.769709,-16.175429,-3.367281

@@ -438,9 +438,12 @@ def _fit_market_models(
     neg_spike_thr = float(y_train.quantile(0.05))
 
     spike_labels_train = ((y_train >= pos_spike_thr) | (y_train <= neg_spike_thr)).astype(int)
+    peak_abs_thr = float(np.quantile(np.abs(y_train.to_numpy(dtype=float)), 0.9))
+    peak_labels_train = (np.abs(y_train.to_numpy(dtype=float)) >= peak_abs_thr).astype(int)
     spike_weights = np.ones(len(y_train), dtype=float)
     spike_weights[y_train.values >= pos_spike_thr] = 4.0
     spike_weights[y_train.values <= neg_spike_thr] = 3.0
+    peak_weights = np.where(peak_labels_train == 1, 5.0, 1.0)
 
     normal_iterations = 900 if fast_dev else 2800
     normal_lr = 0.05 if fast_dev else 0.028
@@ -451,6 +454,11 @@ def _fit_market_models(
     spike_depth = 7 if fast_dev else 8
     spike_es_rounds = 100 if fast_dev else 200
     spike_clf_iterations = 300 if fast_dev else 900
+    peak_iterations = 1200 if fast_dev else 3400
+    peak_lr = 0.04 if fast_dev else 0.02
+    peak_depth = 7 if fast_dev else 8
+    peak_es_rounds = 120 if fast_dev else 220
+    peak_clf_iterations = 320 if fast_dev else 900
     hgb_max_iter = 250 if fast_dev else 700
     hgb_depth = 6 if fast_dev else 7
 
@@ -499,8 +507,33 @@ def _fit_market_models(
         early_stopping_rounds=spike_es_rounds,
     )
 
+    cat_peak = CatBoostRegressor(
+        loss_function="RMSE",
+        eval_metric="RMSE",
+        iterations=peak_iterations,
+        learning_rate=peak_lr,
+        depth=peak_depth,
+        l2_leaf_reg=30,
+        bagging_temperature=0.9,
+        random_strength=1.2,
+        random_seed=seed + 29,
+        verbose=0,
+        **catboost_device_params,
+    )
+    cat_peak.fit(
+        x_train,
+        y_train,
+        cat_features=cat_cols,
+        sample_weight=peak_weights,
+        eval_set=(x_valid, y_valid),
+        use_best_model=True,
+        early_stopping_rounds=peak_es_rounds,
+    )
+
     spike_classifier: CatBoostClassifier | None = None
+    peak_classifier: CatBoostClassifier | None = None
     p_spike_valid = np.full(len(x_valid), 0.15)
+    p_peak_valid = np.full(len(x_valid), 0.10)
 
     if spike_labels_train.sum() >= 30 and spike_labels_train.sum() < len(spike_labels_train) - 30:
         spike_classifier = CatBoostClassifier(
@@ -522,8 +555,29 @@ def _fit_market_models(
         p_spike_valid = spike_classifier.predict_proba(x_valid)[:, 1]
     p_spike_valid = np.clip(p_spike_valid, 0.0, 1.0)
 
+    if peak_labels_train.sum() >= 30 and peak_labels_train.sum() < len(peak_labels_train) - 30:
+        peak_classifier = CatBoostClassifier(
+            loss_function="Logloss",
+            eval_metric="AUC",
+            iterations=peak_clf_iterations,
+            learning_rate=0.035,
+            depth=6,
+            l2_leaf_reg=16,
+            random_seed=seed + 131,
+            verbose=0,
+            **catboost_device_params,
+        )
+        peak_classifier.fit(
+            x_train,
+            peak_labels_train,
+            cat_features=cat_cols,
+        )
+        p_peak_valid = peak_classifier.predict_proba(x_valid)[:, 1]
+    p_peak_valid = np.clip(p_peak_valid, 0.0, 1.0)
+
     cat_normal_valid = np.asarray(cat_normal.predict(x_valid), dtype=float)
     cat_spike_valid = np.asarray(cat_spike.predict(x_valid), dtype=float)
+    cat_peak_valid = np.asarray(cat_peak.predict(x_valid), dtype=float)
 
     hgb = HistGradientBoostingRegressor(
         learning_rate=0.04,
@@ -539,7 +593,9 @@ def _fit_market_models(
     models = {
         "cat_normal": cat_normal,
         "cat_spike": cat_spike,
+        "cat_peak": cat_peak,
         "spike_classifier": spike_classifier,
+        "peak_classifier": peak_classifier,
         "hgb": hgb,
         "pos_spike_thr": pos_spike_thr,
         "neg_spike_thr": neg_spike_thr,
@@ -548,8 +604,10 @@ def _fit_market_models(
     valid_outputs = {
         "cat_normal": cat_normal_valid,
         "cat_spike": cat_spike_valid,
+        "cat_peak": cat_peak_valid,
         "hgb": hgb_valid,
         "p_spike": p_spike_valid,
+        "p_peak": p_peak_valid,
     }
     return models, valid_outputs
 
@@ -561,38 +619,52 @@ def _predict_model_components(
 ) -> dict[str, float]:
     cat_normal: CatBoostRegressor = models["cat_normal"]  # type: ignore[assignment]
     cat_spike: CatBoostRegressor = models["cat_spike"]  # type: ignore[assignment]
+    cat_peak: CatBoostRegressor = models["cat_peak"]  # type: ignore[assignment]
     spike_classifier: CatBoostClassifier | None = models["spike_classifier"]  # type: ignore[assignment]
+    peak_classifier: CatBoostClassifier | None = models["peak_classifier"]  # type: ignore[assignment]
     hgb: HistGradientBoostingRegressor = models["hgb"]  # type: ignore[assignment]
 
     cat_normal_pred = float(cat_normal.predict(row_df)[0])
     cat_spike_pred = float(cat_spike.predict(row_df)[0])
+    cat_peak_pred = float(cat_peak.predict(row_df)[0])
 
     if spike_classifier is not None:
         p_spike = float(spike_classifier.predict_proba(row_df)[:, 1][0])
     else:
         p_spike = 0.15
+    if peak_classifier is not None:
+        p_peak = float(peak_classifier.predict_proba(row_df)[:, 1][0])
+    else:
+        p_peak = 0.10
 
     hgb_pred = float(hgb.predict(row_df[numeric_cols])[0])
     return {
         "cat_normal": cat_normal_pred,
         "cat_spike": cat_spike_pred,
+        "cat_peak": cat_peak_pred,
         "hgb": hgb_pred,
         "p_spike": float(np.clip(p_spike, 0.0, 1.0)),
+        "p_peak": float(np.clip(p_peak, 0.0, 1.0)),
     }
 
 
 def _build_meta_matrix(
     cat_normal: np.ndarray,
     cat_spike: np.ndarray,
+    cat_peak: np.ndarray,
     hgb: np.ndarray,
     p_spike: np.ndarray,
+    p_peak: np.ndarray,
 ) -> np.ndarray:
     return np.column_stack(
         [
             cat_normal,
             cat_spike,
+            cat_peak,
             hgb,
             p_spike,
+            p_peak,
+            p_peak * cat_peak,
         ]
     )
 
@@ -604,8 +676,10 @@ def _stack_residual_prediction(
     row = _build_meta_matrix(
         cat_normal=np.array([components["cat_normal"]], dtype=float),
         cat_spike=np.array([components["cat_spike"]], dtype=float),
+        cat_peak=np.array([components["cat_peak"]], dtype=float),
         hgb=np.array([components["hgb"]], dtype=float),
         p_spike=np.array([components["p_spike"]], dtype=float),
+        p_peak=np.array([components["p_peak"]], dtype=float),
     )
     return float(stacker.predict(row)[0])
 
@@ -936,6 +1010,7 @@ def run_with_ledger(
             print(f"Categorical ({len(cat_cols)}): {cat_cols}")
             print(f"Inference mode: recursive first {int(config['recursive_steps'])} steps, then direct")
             print("Blending mode: residual baseline + OOF stacker + global/local signal")
+            print("Experts: normal + spike + peak (soft-gated)")
 
             predictions_by_id: dict[int, float] = {}
             market_scores: list[tuple[str, float]] = []
@@ -972,8 +1047,10 @@ def run_with_ledger(
                 oof_baseline = np.full(len(market_train), np.nan, dtype=float)
                 oof_cat_normal = np.full(len(market_train), np.nan, dtype=float)
                 oof_cat_spike = np.full(len(market_train), np.nan, dtype=float)
+                oof_cat_peak = np.full(len(market_train), np.nan, dtype=float)
                 oof_hgb = np.full(len(market_train), np.nan, dtype=float)
                 oof_p_spike = np.full(len(market_train), np.nan, dtype=float)
+                oof_p_peak = np.full(len(market_train), np.nan, dtype=float)
                 fold_records: list[dict[str, float | int]] = []
 
                 for fold_id, (train_idx, valid_idx) in enumerate(folds, start=1):
@@ -1007,18 +1084,23 @@ def run_with_ledger(
 
                     cat_normal_pred = np.asarray(valid_outputs["cat_normal"], dtype=float)
                     cat_spike_pred = np.asarray(valid_outputs["cat_spike"], dtype=float)
+                    cat_peak_pred = np.asarray(valid_outputs["cat_peak"], dtype=float)
                     hgb_pred = np.asarray(valid_outputs["hgb"], dtype=float)
                     p_spike_pred = np.asarray(valid_outputs["p_spike"], dtype=float)
+                    p_peak_pred = np.asarray(valid_outputs["p_peak"], dtype=float)
 
                     oof_baseline[valid_idx] = baseline_valid
                     oof_cat_normal[valid_idx] = cat_normal_pred
                     oof_cat_spike[valid_idx] = cat_spike_pred
+                    oof_cat_peak[valid_idx] = cat_peak_pred
                     oof_hgb[valid_idx] = hgb_pred
                     oof_p_spike[valid_idx] = p_spike_pred
+                    oof_p_peak[valid_idx] = p_peak_pred
 
                     fold_blend = baseline_valid + (
-                        0.5 * (p_spike_pred * cat_spike_pred + (1.0 - p_spike_pred) * cat_normal_pred)
-                        + 0.5 * hgb_pred
+                        0.35 * (p_spike_pred * cat_spike_pred + (1.0 - p_spike_pred) * cat_normal_pred)
+                        + 0.35 * hgb_pred
+                        + 0.30 * (p_peak_pred * cat_peak_pred + (1.0 - p_peak_pred) * cat_normal_pred)
                     )
                     rmse_fold = float(mean_squared_error(y_valid, fold_blend) ** 0.5)
                     fold_records.append(
@@ -1047,8 +1129,10 @@ def run_with_ledger(
                     (~np.isnan(oof_baseline))
                     & (~np.isnan(oof_cat_normal))
                     & (~np.isnan(oof_cat_spike))
+                    & (~np.isnan(oof_cat_peak))
                     & (~np.isnan(oof_hgb))
                     & (~np.isnan(oof_p_spike))
+                    & (~np.isnan(oof_p_peak))
                 )
                 if not np.any(valid_mask):
                     continue
@@ -1056,8 +1140,10 @@ def run_with_ledger(
                 meta_x = _build_meta_matrix(
                     cat_normal=oof_cat_normal[valid_mask],
                     cat_spike=oof_cat_spike[valid_mask],
+                    cat_peak=oof_cat_peak[valid_mask],
                     hgb=oof_hgb[valid_mask],
                     p_spike=oof_p_spike[valid_mask],
+                    p_peak=oof_p_peak[valid_mask],
                 )
                 y_residual_target = y_all[valid_mask].to_numpy(dtype=float) - oof_baseline[valid_mask]
                 stacker = make_pipeline(

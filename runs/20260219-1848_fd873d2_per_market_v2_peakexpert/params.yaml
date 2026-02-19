@@ -1,0 +1,21 @@
+run_id: "20260219-1848_fd873d2_per_market_v2_peakexpert"
+started_at: "2026-02-19T17:48:40.567335+00:00"
+git_sha: "fd873d2"
+git_branch: "main"
+dirty_repo: true
+data_hash: "d5d1c3bfcb4b55a8161356b389073d4eb23cae10fbb5f28f06ddbbdee1211ace"
+config_hash: "d5a0a7d542051f08782d89113b08b0bb4412d1b3f1b68294b40a0598b2d902ba"
+config:
+  config_name: "per_market_v2_peakexpert"
+  fast_dev: true
+  exclude_2023: true
+  use_gpu: false
+  gpu_devices: "0"
+  recursive_steps: 6
+  n_splits: 3
+  purge_days: 1
+  min_train_days: 7
+  base_seed: 42
+  final_seed: 999
+  correction_alpha: 0.6
+  min_market_rows: 400

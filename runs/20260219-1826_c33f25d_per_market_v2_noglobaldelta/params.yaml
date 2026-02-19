@@ -1,0 +1,21 @@
+run_id: "20260219-1826_c33f25d_per_market_v2_noglobaldelta"
+started_at: "2026-02-19T17:26:38.333928+00:00"
+git_sha: "c33f25d"
+git_branch: "main"
+dirty_repo: true
+data_hash: "d5d1c3bfcb4b55a8161356b389073d4eb23cae10fbb5f28f06ddbbdee1211ace"
+config_hash: "6f86dfad80d6c69b82870d1e87f2780e9871ec26720e59c4fa54bb2d69daf121"
+config:
+  config_name: "per_market_v2_noglobaldelta"
+  fast_dev: true
+  exclude_2023: true
+  use_gpu: false
+  gpu_devices: "0"
+  recursive_steps: 6
+  n_splits: 3
+  purge_days: 1
+  min_train_days: 7
+  base_seed: 42
+  final_seed: 999
+  correction_alpha: 0.6
+  min_market_rows: 400

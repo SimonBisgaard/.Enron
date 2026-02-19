@@ -1,0 +1,138 @@
+{
+  "config": {
+    "base_seed": 42,
+    "config_name": "per_market_v2_with_globaldelta",
+    "correction_alpha": 0.6,
+    "exclude_2023": true,
+    "fast_dev": true,
+    "final_seed": 999,
+    "gpu_devices": "0",
+    "min_market_rows": 400,
+    "min_train_days": 7,
+    "n_splits": 3,
+    "purge_days": 1,
+    "recursive_steps": 6,
+    "use_gpu": false
+  },
+  "config_hash": "58063395f180fbe1d0e07d2fb267a22f693bf4f73e43d04dd606734386b2a94d",
+  "cv_rmse": 56.40582444618536,
+  "data_hash": "d5d1c3bfcb4b55a8161356b389073d4eb23cae10fbb5f28f06ddbbdee1211ace",
+  "dirty_repo": true,
+  "fold_rmse_mean_all": 53.96575648332128,
+  "fold_rmse_mean_last2": 40.79260731370564,
+  "fold_rmse_mean_worst": 81.02580872209823,
+  "git_branch": "main",
+  "git_sha": "c33f25d",
+  "lb_score": null,
+  "market_diagnostics": [
+    {
+      "fold_rmse_list": [
+        91.7173806737313,
+        62.04697598576574,
+        56.178059650057975
+      ],
+      "fold_rmse_mean_all": 69.98080543651834,
+      "fold_rmse_mean_last2": 59.11251781791186,
+      "fold_rmse_std": 15.555707891770771,
+      "fold_rmse_worst": 91.7173806737313,
+      "market": "Market A",
+      "oof_rmse": 65.29854176571023
+    },
+    {
+      "fold_rmse_list": [
+        59.13849564472843,
+        63.42101904200242,
+        36.21649586420813
+      ],
+      "fold_rmse_mean_all": 52.92533685031299,
+      "fold_rmse_mean_last2": 49.81875745310528,
+      "fold_rmse_std": 11.943590386653787,
+      "fold_rmse_worst": 63.42101904200242,
+      "market": "Market B",
+      "oof_rmse": 53.08197091122467
+    },
+    {
+      "fold_rmse_list": [
+        106.76002233929695,
+        25.8702773930112,
+        28.238246426614747
+      ],
+      "fold_rmse_mean_all": 53.62284871964096,
+      "fold_rmse_mean_last2": 27.054261909812972,
+      "fold_rmse_std": 37.58608993187173,
+      "fold_rmse_worst": 106.76002233929695,
+      "market": "Market C",
+      "oof_rmse": 64.68963627661218
+    },
+    {
+      "fold_rmse_list": [
+        100.97656616111806,
+        38.69853502615848,
+        34.15685179558571
+      ],
+      "fold_rmse_mean_all": 57.94398432762075,
+      "fold_rmse_mean_last2": 36.427693410872095,
+      "fold_rmse_std": 30.485067886690562,
+      "fold_rmse_worst": 100.97656616111806,
+      "market": "Market D",
+      "oof_rmse": 60.96858298023222
+    },
+    {
+      "fold_rmse_list": [
+        58.99436737646537,
+        52.99766634126339,
+        35.989117853365755
+      ],
+      "fold_rmse_mean_all": 49.327050523698176,
+      "fold_rmse_mean_last2": 44.49339209731457,
+      "fold_rmse_std": 9.743902085069708,
+      "fold_rmse_worst": 58.99436737646537,
+      "market": "Market E",
+      "oof_rmse": 48.828865891212246
+    },
+    {
+      "fold_rmse_list": [
+        64.28549673997526,
+        27.433142754001416,
+        28.264899632432687
+      ],
+      "fold_rmse_mean_all": 39.994513042136454,
+      "fold_rmse_mean_last2": 27.84902119321705,
+      "fold_rmse_std": 17.179675426361765,
+      "fold_rmse_worst": 64.28549673997526,
+      "market": "Market F",
+      "oof_rmse": 41.496164879843526
+    }
+  ],
+  "market_scores": [
+    {
+      "market": "Market A",
+      "rmse": 65.29854176571023
+    },
+    {
+      "market": "Market B",
+      "rmse": 53.08197091122467
+    },
+    {
+      "market": "Market C",
+      "rmse": 64.68963627661218
+    },
+    {
+      "market": "Market D",
+      "rmse": 60.96858298023222
+    },
+    {
+      "market": "Market E",
+      "rmse": 48.828865891212246
+    },
+    {
+      "market": "Market F",
+      "rmse": 41.496164879843526
+    }
+  ],
+  "model_path": "/Users/simonbisgaard/Desktop/nitor/runs/20260219-1835_c33f25d_per_market_v2_with_globaldelta/models_manifest.txt",
+  "oof_path": "/Users/simonbisgaard/Desktop/nitor/runs/20260219-1835_c33f25d_per_market_v2_with_globaldelta/oof.csv",
+  "run_id": "20260219-1835_c33f25d_per_market_v2_with_globaldelta",
+  "started_at": "2026-02-19T17:35:10.002276+00:00",
+  "submission_path": "/Users/simonbisgaard/Desktop/nitor/runs/20260219-1835_c33f25d_per_market_v2_with_globaldelta/submission.csv"
+}

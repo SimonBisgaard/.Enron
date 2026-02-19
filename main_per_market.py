@@ -1,4 +1,11 @@
 from pathlib import Path
+import argparse
+import csv
+from datetime import datetime, timezone
+import hashlib
+import json
+import subprocess
+import sys
 
 import numpy as np
 import pandas as pd
@@ -8,6 +15,111 @@ from sklearn.metrics import mean_squared_error
 
 LAG_STEPS = [1, 2, 24, 48, 168]
 ROLL_WINDOWS = [24, 48, 168]
+
+
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+def _run_git_command(args: list[str], cwd: Path) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return "unknown"
+    return result.stdout.strip()
+
+
+def _get_git_info(repo_root: Path) -> dict[str, str | bool]:
+    git_sha = _run_git_command(["rev-parse", "--short", "HEAD"], repo_root)
+    git_branch = _run_git_command(["rev-parse", "--abbrev-ref", "HEAD"], repo_root)
+    dirty_out = _run_git_command(["status", "--porcelain"], repo_root)
+    dirty_repo = dirty_out not in {"", "unknown"}
+    return {
+        "git_sha": git_sha,
+        "git_branch": git_branch,
+        "dirty_repo": dirty_repo,
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as file_handle:
+        while True:
+            chunk = file_handle.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _stable_json(data: dict) -> str:
+    return json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2)
+
+
+def _write_params_yaml(path: Path, payload: dict) -> None:
+    def _format_value(value) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if value is None:
+            return "null"
+        if isinstance(value, (int, float)):
+            return str(value)
+        return json.dumps(str(value), ensure_ascii=False)
+
+    lines: list[str] = []
+    for key, value in payload.items():
+        if isinstance(value, dict):
+            lines.append(f"{key}:")
+            for sub_key, sub_value in value.items():
+                lines.append(f"  {sub_key}: {_format_value(sub_value)}")
+        else:
+            lines.append(f"{key}: {_format_value(value)}")
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _append_experiment_registry(registry_path: Path, row: dict[str, str]) -> None:
+    fieldnames = [
+        "run_id",
+        "git_sha",
+        "git_branch",
+        "dirty_repo",
+        "data_hash",
+        "config_hash",
+        "seed",
+        "cv_rmse",
+        "lb_score",
+        "model_path",
+        "submission_path",
+        "started_at",
+    ]
+
+    needs_header = not registry_path.exists()
+    with registry_path.open("a", newline="", encoding="utf-8") as file_handle:
+        writer = csv.DictWriter(file_handle, fieldnames=fieldnames)
+        if needs_header:
+            writer.writeheader()
+        writer.writerow({key: row.get(key, "") for key in fieldnames})
 
 
 def _add_harmonics(df: pd.DataFrame, column: str, period: int, harmonics: tuple[int, ...] = (1, 2, 3)) -> None:
@@ -449,196 +561,361 @@ def _recursive_predict_market(
     return pd.Series(preds, index=test_market_df.index, dtype=float)
 
 
-def main() -> None:
+def _build_default_config(config_name: str) -> dict:
+    return {
+        "config_name": config_name,
+        "n_splits": 5,
+        "purge_days": 2,
+        "min_train_days": 10,
+        "base_seed": 42,
+        "final_seed": 999,
+        "correction_alpha": 0.6,
+        "min_market_rows": 400,
+    }
+
+
+def run_with_ledger(config_name: str, official_run: bool, lb_score: float | None) -> dict[str, str]:
     base_dir = Path(__file__).resolve().parent
     data_dir = base_dir / "data"
+    runs_dir = base_dir / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
 
     train_path = data_dir / "train.csv"
     test_path = data_dir / "test_for_participants.csv"
     sample_submission_path = data_dir / "sample_submission.csv"
-    output_path = base_dir / "submission_per_market.csv"
 
-    train_df = pd.read_csv(train_path)
-    test_df = pd.read_csv(test_path)
-    sample_submission = pd.read_csv(sample_submission_path)
+    for path in [train_path, test_path, sample_submission_path]:
+        if not path.exists():
+            raise FileNotFoundError(f"Missing required file: {path}")
 
-    train_df = add_time_features(train_df)
-    test_df = add_time_features(test_df)
+    git_info = _get_git_info(base_dir)
+    if official_run and bool(git_info["dirty_repo"]):
+        raise RuntimeError("Official runs require a clean repository (dirty_repo=false).")
 
-    train_df, test_df = add_residual_load_features(train_df, test_df)
+    started_at = datetime.now(timezone.utc).isoformat()
+    safe_config_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in config_name).strip("-")
+    if not safe_config_name:
+        safe_config_name = "default"
+    run_timestamp = datetime.now().strftime("%Y%m%d-%H%M")
+    git_sha = str(git_info["git_sha"])
+    run_id = f"{run_timestamp}_{git_sha}_{safe_config_name}"
 
-    train_df = add_train_lag_features(train_df)
-    test_df = add_test_base_features(test_df)
+    run_dir = runs_dir / run_id
+    if run_dir.exists():
+        raise FileExistsError(f"Run directory already exists: {run_dir}")
+    run_dir.mkdir(parents=True, exist_ok=False)
 
-    feature_cols = [col for col in train_df.columns if col not in ["id", "target", "market"]]
-    constant_cols = [col for col in feature_cols if train_df[col].nunique(dropna=False) <= 1]
-    if constant_cols:
-        train_df = train_df.drop(columns=constant_cols)
-        test_df = test_df.drop(columns=constant_cols)
-        feature_cols = [col for col in feature_cols if col not in constant_cols]
+    train_log_path = run_dir / "train.log"
+    params_path = run_dir / "params.yaml"
+    metrics_path = run_dir / "metrics.json"
+    oof_path = run_dir / "oof.csv"
+    submission_path = run_dir / "submission.csv"
+    model_manifest_path = run_dir / "models_manifest.txt"
+    registry_path = base_dir / "experiments.csv"
 
-    cat_cols = train_df[feature_cols].select_dtypes(include=["object", "category", "string"]).columns.tolist()
-    numeric_cols = [col for col in feature_cols if col not in cat_cols]
+    config = _build_default_config(safe_config_name)
+    config_hash = _hash_text(_stable_json(config))
+    train_hash = _sha256_file(train_path)
+    test_hash = _sha256_file(test_path)
+    data_hash = _hash_text(f"{train_hash}:{test_hash}")
 
-    print(f"Using {len(feature_cols)} features total")
-    print(f"Categorical ({len(cat_cols)}): {cat_cols}")
+    _write_params_yaml(
+        params_path,
+        {
+            "run_id": run_id,
+            "started_at": started_at,
+            "git_sha": git_info["git_sha"],
+            "git_branch": git_info["git_branch"],
+            "dirty_repo": bool(git_info["dirty_repo"]),
+            "data_hash": data_hash,
+            "config_hash": config_hash,
+            "config": config,
+        },
+    )
 
-    predictions_by_id: dict[int, float] = {}
-    market_scores: list[tuple[str, float]] = []
+    orig_stdout = sys.stdout
+    orig_stderr = sys.stderr
 
-    for market in sorted(train_df["market"].dropna().unique()):
-        market_train = train_df[train_df["market"] == market].sort_values(["delivery_start_ts", "id"]).reset_index(drop=True)
-        market_test = test_df[test_df["market"] == market].sort_values(["delivery_start_ts", "id"]).reset_index(drop=True)
+    with train_log_path.open("w", encoding="utf-8") as log_file:
+        tee_stream = _Tee(orig_stdout, log_file)
+        sys.stdout = tee_stream
+        sys.stderr = tee_stream
+        try:
+            train_df = pd.read_csv(train_path)
+            test_df = pd.read_csv(test_path)
+            sample_submission = pd.read_csv(sample_submission_path)
 
-        if len(market_train) < 400 or market_test.empty:
-            continue
+            train_df = add_time_features(train_df)
+            test_df = add_time_features(test_df)
 
-        for col in numeric_cols:
-            median_value = float(market_train[col].median())
-            market_train[col] = market_train[col].fillna(median_value)
-            market_test[col] = market_test[col].fillna(median_value)
+            train_df, test_df = add_residual_load_features(train_df, test_df)
 
-        for col in cat_cols:
-            market_train[col] = market_train[col].fillna("missing").astype(str)
-            market_test[col] = market_test[col].fillna("missing").astype(str)
+            train_df = add_train_lag_features(train_df)
+            test_df = add_test_base_features(test_df)
 
-        folds = make_market_day_folds(
-            market_df=market_train,
-            n_splits=5,
-            purge_days=2,
-            min_train_days=10,
-        )
-        if len(folds) < 2:
-            continue
+            feature_cols = [col for col in train_df.columns if col not in ["id", "target", "market"]]
+            constant_cols = [col for col in feature_cols if train_df[col].nunique(dropna=False) <= 1]
+            if constant_cols:
+                train_df = train_df.drop(columns=constant_cols)
+                test_df = test_df.drop(columns=constant_cols)
+                feature_cols = [col for col in feature_cols if col not in constant_cols]
 
-        y_all = market_train["target"].copy()
-        oof_cat = np.full(len(market_train), np.nan, dtype=float)
-        oof_hgb = np.full(len(market_train), np.nan, dtype=float)
-        fold_records: list[dict[str, float | int]] = []
+            cat_cols = train_df[feature_cols].select_dtypes(include=["object", "category", "string"]).columns.tolist()
+            numeric_cols = [col for col in feature_cols if col not in cat_cols]
 
-        for fold_id, (train_idx, valid_idx) in enumerate(folds, start=1):
-            x_train = market_train.iloc[train_idx][feature_cols].copy()
-            y_train = y_all.iloc[train_idx]
-            x_valid = market_train.iloc[valid_idx][feature_cols].copy()
-            y_valid = y_all.iloc[valid_idx]
+            print(f"Run ID: {run_id}")
+            print(f"Using {len(feature_cols)} features total")
+            print(f"Categorical ({len(cat_cols)}): {cat_cols}")
 
-            models, valid_outputs = _fit_market_models(
-                x_train=x_train,
-                y_train=y_train,
-                x_valid=x_valid,
-                y_valid=y_valid,
-                cat_cols=cat_cols,
-                numeric_cols=numeric_cols,
-                seed=42 + fold_id,
-            )
+            predictions_by_id: dict[int, float] = {}
+            market_scores: list[tuple[str, float]] = []
+            model_manifest_rows: list[str] = []
+            oof_frames: list[pd.DataFrame] = []
 
-            cat_pred = np.asarray(valid_outputs["cat_regime"], dtype=float)
-            hgb_pred = np.asarray(valid_outputs["hgb"], dtype=float)
+            for market in sorted(train_df["market"].dropna().unique()):
+                market_train = train_df[train_df["market"] == market].sort_values(["delivery_start_ts", "id"]).reset_index(drop=True)
+                market_test = test_df[test_df["market"] == market].sort_values(["delivery_start_ts", "id"]).reset_index(drop=True)
 
-            oof_cat[valid_idx] = cat_pred
-            oof_hgb[valid_idx] = hgb_pred
+                if len(market_train) < int(config["min_market_rows"]) or market_test.empty:
+                    continue
 
-            rmse_cat = float(mean_squared_error(y_valid, cat_pred) ** 0.5)
-            rmse_hgb = float(mean_squared_error(y_valid, hgb_pred) ** 0.5)
-            fold_records.append(
-                {
-                    "fold": fold_id,
-                    "rmse_cat": rmse_cat,
-                    "rmse_hgb": rmse_hgb,
-                }
-            )
-            print(f"{market} | Fold {fold_id}/{len(folds)} | RMSE cat={rmse_cat:.6f}, hgb={rmse_hgb:.6f}")
+                for col in numeric_cols:
+                    median_value = float(market_train[col].median())
+                    market_train[col] = market_train[col].fillna(median_value)
+                    market_test[col] = market_test[col].fillna(median_value)
 
-        valid_mask = (~np.isnan(oof_cat)) & (~np.isnan(oof_hgb))
-        if not np.any(valid_mask):
-            continue
+                for col in cat_cols:
+                    market_train[col] = market_train[col].fillna("missing").astype(str)
+                    market_test[col] = market_test[col].fillna("missing").astype(str)
 
-        recent = sorted(fold_records, key=lambda x: int(x["fold"]))[-2:]
-        cat_recent_rmse = float(np.mean([float(record["rmse_cat"]) for record in recent]))
-        hgb_recent_rmse = float(np.mean([float(record["rmse_hgb"]) for record in recent]))
+                folds = make_market_day_folds(
+                    market_df=market_train,
+                    n_splits=int(config["n_splits"]),
+                    purge_days=int(config["purge_days"]),
+                    min_train_days=int(config["min_train_days"]),
+                )
+                if len(folds) < 2:
+                    continue
 
-        inv_cat = 1.0 / (cat_recent_rmse + 1e-9)
-        inv_hgb = 1.0 / (hgb_recent_rmse + 1e-9)
-        cat_weight = inv_cat / (inv_cat + inv_hgb)
-        hgb_weight = inv_hgb / (inv_cat + inv_hgb)
+                y_all = market_train["target"].copy()
+                oof_cat = np.full(len(market_train), np.nan, dtype=float)
+                oof_hgb = np.full(len(market_train), np.nan, dtype=float)
+                fold_records: list[dict[str, float | int]] = []
 
-        oof_blend = cat_weight * oof_cat[valid_mask] + hgb_weight * oof_hgb[valid_mask]
-        market_oof_rmse = float(mean_squared_error(y_all[valid_mask], oof_blend) ** 0.5)
-        market_scores.append((market, market_oof_rmse))
+                for fold_id, (train_idx, valid_idx) in enumerate(folds, start=1):
+                    x_train = market_train.iloc[train_idx][feature_cols].copy()
+                    y_train = y_all.iloc[train_idx]
+                    x_valid = market_train.iloc[valid_idx][feature_cols].copy()
+                    y_valid = y_all.iloc[valid_idx]
 
-        residual_df = pd.DataFrame(
-            {
-                "hour": market_train.loc[valid_mask, "delivery_start_hour"].to_numpy(),
-                "dow": market_train.loc[valid_mask, "delivery_start_dow"].to_numpy(),
-                "residual": (y_all[valid_mask].to_numpy() - oof_blend),
+                    models, valid_outputs = _fit_market_models(
+                        x_train=x_train,
+                        y_train=y_train,
+                        x_valid=x_valid,
+                        y_valid=y_valid,
+                        cat_cols=cat_cols,
+                        numeric_cols=numeric_cols,
+                        seed=int(config["base_seed"]) + fold_id,
+                    )
+
+                    cat_pred = np.asarray(valid_outputs["cat_regime"], dtype=float)
+                    hgb_pred = np.asarray(valid_outputs["hgb"], dtype=float)
+
+                    oof_cat[valid_idx] = cat_pred
+                    oof_hgb[valid_idx] = hgb_pred
+
+                    rmse_cat = float(mean_squared_error(y_valid, cat_pred) ** 0.5)
+                    rmse_hgb = float(mean_squared_error(y_valid, hgb_pred) ** 0.5)
+                    fold_records.append(
+                        {
+                            "fold": fold_id,
+                            "rmse_cat": rmse_cat,
+                            "rmse_hgb": rmse_hgb,
+                        }
+                    )
+                    print(f"{market} | Fold {fold_id}/{len(folds)} | RMSE cat={rmse_cat:.6f}, hgb={rmse_hgb:.6f}")
+
+                valid_mask = (~np.isnan(oof_cat)) & (~np.isnan(oof_hgb))
+                if not np.any(valid_mask):
+                    continue
+
+                recent = sorted(fold_records, key=lambda x: int(x["fold"]))[-2:]
+                cat_recent_rmse = float(np.mean([float(record["rmse_cat"]) for record in recent]))
+                hgb_recent_rmse = float(np.mean([float(record["rmse_hgb"]) for record in recent]))
+
+                inv_cat = 1.0 / (cat_recent_rmse + 1e-9)
+                inv_hgb = 1.0 / (hgb_recent_rmse + 1e-9)
+                cat_weight = inv_cat / (inv_cat + inv_hgb)
+                hgb_weight = inv_hgb / (inv_cat + inv_hgb)
+
+                oof_blend = cat_weight * oof_cat[valid_mask] + hgb_weight * oof_hgb[valid_mask]
+                market_oof_rmse = float(mean_squared_error(y_all[valid_mask], oof_blend) ** 0.5)
+                market_scores.append((market, market_oof_rmse))
+
+                oof_market = pd.DataFrame(
+                    {
+                        "id": market_train.loc[valid_mask, "id"].to_numpy(),
+                        "market": market,
+                        "target": y_all[valid_mask].to_numpy(),
+                        "pred": oof_blend,
+                    }
+                )
+                oof_frames.append(oof_market)
+
+                residual_df = pd.DataFrame(
+                    {
+                        "hour": market_train.loc[valid_mask, "delivery_start_hour"].to_numpy(),
+                        "dow": market_train.loc[valid_mask, "delivery_start_dow"].to_numpy(),
+                        "residual": (y_all[valid_mask].to_numpy() - oof_blend),
+                    }
+                )
+                residual_correction = residual_df.groupby(["hour", "dow"])["residual"].mean().to_dict()
+
+                x_full = market_train[feature_cols].copy()
+                y_full = y_all.copy()
+
+                holdout_size = max(24, int(len(market_train) * 0.1))
+                x_fit = x_full.iloc[:-holdout_size]
+                y_fit = y_full.iloc[:-holdout_size]
+                x_cal = x_full.iloc[-holdout_size:]
+                y_cal = y_full.iloc[-holdout_size:]
+
+                final_models, _ = _fit_market_models(
+                    x_train=x_fit,
+                    y_train=y_fit,
+                    x_valid=x_cal,
+                    y_valid=y_cal,
+                    cat_cols=cat_cols,
+                    numeric_cols=numeric_cols,
+                    seed=int(config["final_seed"]),
+                )
+
+                num_fill_values = {col: float(market_train[col].median()) for col in numeric_cols}
+                history_targets = y_full.astype(float).tolist()
+                test_preds = _recursive_predict_market(
+                    test_market_df=market_test,
+                    feature_cols=feature_cols,
+                    numeric_cols=numeric_cols,
+                    cat_cols=cat_cols,
+                    num_fill_values=num_fill_values,
+                    history_targets=history_targets,
+                    models=final_models,
+                    cat_weight=cat_weight,
+                    hgb_weight=hgb_weight,
+                )
+
+                correction_values = [
+                    float(config["correction_alpha"]) * residual_correction.get((int(row["delivery_start_hour"]), int(row["delivery_start_dow"])), 0.0)
+                    for _, row in market_test.iterrows()
+                ]
+                calibrated_preds = test_preds.to_numpy() + np.array(correction_values, dtype=float)
+
+                for i, pred in enumerate(calibrated_preds):
+                    test_id = int(market_test.iloc[i]["id"])
+                    predictions_by_id[test_id] = float(pred)
+
+                model_manifest_rows.append(
+                    f"market={market}, oof_rmse={market_oof_rmse:.6f}, cat_weight={cat_weight:.4f}, hgb_weight={hgb_weight:.4f}"
+                )
+                print(
+                    f"{market} | OOF RMSE={market_oof_rmse:.6f} | recent-blend weights: cat={cat_weight:.3f}, hgb={hgb_weight:.3f}"
+                )
+
+            submission = sample_submission[["id"]].copy()
+            submission["target"] = submission["id"].map(predictions_by_id)
+
+            if submission["target"].isna().any():
+                missing_count = int(submission["target"].isna().sum())
+                raise ValueError(f"Missing predictions for {missing_count} ids.")
+
+            submission.to_csv(submission_path, index=False)
+
+            if oof_frames:
+                oof_df = pd.concat(oof_frames, ignore_index=True)
+                oof_df.to_csv(oof_path, index=False)
+                cv_rmse = float(mean_squared_error(oof_df["target"], oof_df["pred"]) ** 0.5)
+            else:
+                oof_df = pd.DataFrame(columns=["id", "market", "target", "pred"])
+                oof_df.to_csv(oof_path, index=False)
+                cv_rmse = float("nan")
+
+            model_manifest_path.write_text("\n".join(model_manifest_rows) + "\n", encoding="utf-8")
+
+            if market_scores:
+                print("Per-market CV RMSE (day folds):")
+                for market, score in sorted(market_scores, key=lambda x: x[1]):
+                    print(f"  {market}: {score:.6f}")
+                print(f"Mean per-market RMSE: {np.mean([score for _, score in market_scores]):.6f}")
+            print(submission.head())
+
+            metrics = {
+                "run_id": run_id,
+                "started_at": started_at,
+                "cv_rmse": cv_rmse,
+                "lb_score": lb_score,
+                "market_scores": [{"market": market, "rmse": score} for market, score in market_scores],
+                "git_sha": git_sha,
+                "git_branch": str(git_info["git_branch"]),
+                "dirty_repo": bool(git_info["dirty_repo"]),
+                "data_hash": data_hash,
+                "config_hash": config_hash,
+                "config": config,
+                "model_path": str(model_manifest_path),
+                "submission_path": str(submission_path),
+                "oof_path": str(oof_path),
             }
-        )
-        residual_correction = residual_df.groupby(["hour", "dow"])["residual"].mean().to_dict()
+            metrics_path.write_text(_stable_json(metrics) + "\n", encoding="utf-8")
 
-        x_full = market_train[feature_cols].copy()
-        y_full = y_all.copy()
+            registry_row = {
+                "run_id": run_id,
+                "git_sha": git_sha,
+                "git_branch": str(git_info["git_branch"]),
+                "dirty_repo": str(bool(git_info["dirty_repo"])).lower(),
+                "data_hash": data_hash,
+                "config_hash": config_hash,
+                "seed": str(config["base_seed"]),
+                "cv_rmse": "" if np.isnan(cv_rmse) else f"{cv_rmse:.6f}",
+                "lb_score": "" if lb_score is None else str(lb_score),
+                "model_path": str(model_manifest_path.relative_to(base_dir)),
+                "submission_path": str(submission_path.relative_to(base_dir)),
+                "started_at": started_at,
+            }
+            _append_experiment_registry(registry_path, registry_row)
 
-        holdout_size = max(24, int(len(market_train) * 0.1))
-        x_fit = x_full.iloc[:-holdout_size]
-        y_fit = y_full.iloc[:-holdout_size]
-        x_cal = x_full.iloc[-holdout_size:]
-        y_cal = y_full.iloc[-holdout_size:]
+            latest_submission_path = base_dir / "submission_per_market.csv"
+            submission.to_csv(latest_submission_path, index=False)
 
-        final_models, _ = _fit_market_models(
-            x_train=x_fit,
-            y_train=y_fit,
-            x_valid=x_cal,
-            y_valid=y_cal,
-            cat_cols=cat_cols,
-            numeric_cols=numeric_cols,
-            seed=999,
-        )
+            print(f"Saved run artifacts under: {run_dir}")
+            print(f"Saved latest submission copy: {latest_submission_path}")
+            print(f"Registry updated: {registry_path}")
+        finally:
+            sys.stdout = orig_stdout
+            sys.stderr = orig_stderr
 
-        num_fill_values = {col: float(market_train[col].median()) for col in numeric_cols}
-        history_targets = y_full.astype(float).tolist()
-        test_preds = _recursive_predict_market(
-            test_market_df=market_test,
-            feature_cols=feature_cols,
-            numeric_cols=numeric_cols,
-            cat_cols=cat_cols,
-            num_fill_values=num_fill_values,
-            history_targets=history_targets,
-            models=final_models,
-            cat_weight=cat_weight,
-            hgb_weight=hgb_weight,
-        )
+    return {
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "registry": str(registry_path),
+        "submission": str(submission_path),
+    }
 
-        correction_alpha = 0.6
-        correction_values = [
-            correction_alpha * residual_correction.get((int(row["delivery_start_hour"]), int(row["delivery_start_dow"])), 0.0)
-            for _, row in market_test.iterrows()
-        ]
-        calibrated_preds = test_preds.to_numpy() + np.array(correction_values, dtype=float)
 
-        for i, pred in enumerate(calibrated_preds):
-            test_id = int(market_test.iloc[i]["id"])
-            predictions_by_id[test_id] = float(pred)
-
-        print(
-            f"{market} | OOF RMSE={market_oof_rmse:.6f} | recent-blend weights: cat={cat_weight:.3f}, hgb={hgb_weight:.3f}"
-        )
-
-    submission = sample_submission[["id"]].copy()
-    submission["target"] = submission["id"].map(predictions_by_id)
-
-    if submission["target"].isna().any():
-        missing_count = int(submission["target"].isna().sum())
-        raise ValueError(f"Missing predictions for {missing_count} ids.")
-
-    submission.to_csv(output_path, index=False)
-
-    print(f"Saved per-market submission: {output_path}")
-    if market_scores:
-        print("Per-market CV RMSE (timestamp folds):")
-        for market, score in sorted(market_scores, key=lambda x: x[1]):
-            print(f"  {market}: {score:.6f}")
-        print(f"Mean per-market RMSE: {np.mean([score for _, score in market_scores]):.6f}")
-    print(submission.head())
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train per-market model with strict run ledger logging.")
+    parser.add_argument("--config-name", default="per_market_v1", help="Config name for run_id and ledger entries.")
+    parser.add_argument(
+        "--official-run",
+        action="store_true",
+        help="Require clean git repository before training run.",
+    )
+    parser.add_argument(
+        "--lb-score",
+        type=float,
+        default=None,
+        help="Optional leaderboard score to include at run time.",
+    )
+    args = parser.parse_args()
+    run_with_ledger(config_name=args.config_name, official_run=args.official_run, lb_score=args.lb_score)
 
 
 if __name__ == "__main__":

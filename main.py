@@ -20,6 +20,7 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
 	result = df.copy()
 	start_ts = pd.to_datetime(result["delivery_start"], errors="coerce")
 	end_ts = pd.to_datetime(result["delivery_end"], errors="coerce")
+	epoch = pd.Timestamp("1970-01-01")
 
 	for col, ts in [("delivery_start", start_ts), ("delivery_end", end_ts)]:
 		result[f"{col}_hour"] = ts.dt.hour
@@ -32,7 +33,7 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
 		_add_cyclical_features(result, f"{col}_dow", 7)
 
 	result["delivery_duration_hours"] = (end_ts - start_ts).dt.total_seconds() / 3600.0
-	result["delivery_start_ts"] = start_ts.astype("int64") // 10**9
+	result["delivery_start_ts"] = ((start_ts - epoch) // pd.Timedelta(seconds=1)).astype("int64")
 
 	if {"air_temperature_2m", "dew_point_temperature_2m"}.issubset(result.columns):
 		result["temp_dew_spread"] = result["air_temperature_2m"] - result["dew_point_temperature_2m"]

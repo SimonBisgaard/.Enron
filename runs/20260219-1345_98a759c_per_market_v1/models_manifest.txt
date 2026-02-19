@@ -1,0 +1,6 @@
+market=Market A, oof_rmse=64.156982, cat_weight=0.5295, hgb_weight=0.4705
+market=Market B, oof_rmse=59.067782, cat_weight=0.5610, hgb_weight=0.4390
+market=Market C, oof_rmse=52.619638, cat_weight=0.5452, hgb_weight=0.4548
+market=Market D, oof_rmse=111.843428, cat_weight=0.6111, hgb_weight=0.3889
+market=Market E, oof_rmse=59.617188, cat_weight=0.5685, hgb_weight=0.4315
+market=Market F, oof_rmse=59.456521, cat_weight=0.5133, hgb_weight=0.4867

@@ -1,0 +1,17 @@
+run_id: "20260219-1345_98a759c_per_market_v1"
+started_at: "2026-02-19T12:45:53.794961+00:00"
+git_sha: "98a759c"
+git_branch: "main"
+dirty_repo: true
+data_hash: "d5d1c3bfcb4b55a8161356b389073d4eb23cae10fbb5f28f06ddbbdee1211ace"
+config_hash: "0debfc9bea3f382acbd078eec30e13b3e07601e26f68426cb05bbd3aeca2fa0e"
+config:
+  config_name: "per_market_v1"
+  exclude_2023: true
+  n_splits: 5
+  purge_days: 2
+  min_train_days: 10
+  base_seed: 42
+  final_seed: 999
+  correction_alpha: 0.6
+  min_market_rows: 400

@@ -11,6 +11,13 @@ from catboost import CatBoostRegressor, Pool
 from train_per_market_interactions import apply_exclude_2023, build_feature_table
 
 
+def _predict_point(model: CatBoostRegressor, X: pd.DataFrame) -> np.ndarray:
+    pred = np.asarray(model.predict(X))
+    if pred.ndim == 2:
+        return pred[:, 0].astype(float)
+    return pred.astype(float)
+
+
 def _latest_saved_run(runs_root: Path) -> Path:
     candidates = [p for p in runs_root.iterdir() if (p / "model_metadata.json").exists()]
     if not candidates:
@@ -67,7 +74,7 @@ def main() -> None:
     cat_cols: list[str] = meta["cat_cols"]
 
     train_local = train_feat.copy()
-    train_local["global_pred_feature"] = global_model.predict(train_feat[global_feature_cols])
+    train_local["global_pred_feature"] = _predict_point(global_model, train_feat[global_feature_cols])
 
     global_sample = _sample_df(train_feat, args.global_sample_size, args.seed)
     global_pool = Pool(
@@ -77,7 +84,7 @@ def main() -> None:
     shap_global = global_model.get_feature_importance(global_pool, type="ShapValues")
     shap_global_vals = shap_global[:, :-1]
     shap_global_base = shap_global[:, -1]
-    global_preds = global_model.predict(global_sample[global_feature_cols])
+    global_preds = _predict_point(global_model, global_sample[global_feature_cols])
 
     global_imp = pd.DataFrame(
         {"feature": global_feature_cols, "mean_abs_shap": np.abs(shap_global_vals).mean(axis=0)}
@@ -85,10 +92,12 @@ def main() -> None:
     global_imp.to_csv(run_dir / "global_feature_importance_shap.csv", index=False)
 
     global_rows = global_sample[["id", "market", "delivery_start", "target"]].reset_index(drop=True)
-    global_rows["base_value"] = shap_global_base
-    global_rows["prediction"] = global_preds
-    for i, feat in enumerate(global_feature_cols):
-        global_rows[f"shap__{feat}"] = shap_global_vals[:, i]
+    global_rows = global_rows.assign(base_value=shap_global_base, prediction=global_preds)
+    shap_cols = pd.DataFrame(
+        shap_global_vals,
+        columns=[f"shap__{feat}" for feat in global_feature_cols],
+    )
+    global_rows = pd.concat([global_rows, shap_cols], axis=1)
     global_rows.to_csv(run_dir / "global_shap_sample_rows.csv", index=False)
 
     local_rows: list[dict[str, object]] = []

@@ -33,6 +33,9 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     out["dow_cos"] = np.cos(2.0 * np.pi * out["dow"] / 7.0)
     out["month_sin"] = np.sin(2.0 * np.pi * out["month"] / 12.0)
     out["month_cos"] = np.cos(2.0 * np.pi * out["month"] / 12.0)
+    out["is_morning_peak"] = out["hour"].isin([7, 8, 9]).astype(int)
+    out["is_evening_peak"] = out["hour"].isin([17, 18, 19, 20]).astype(int)
+    out["is_winter"] = out["month"].isin([11, 12, 1, 2, 3]).astype(int)
     return out
 
 
@@ -45,6 +48,11 @@ def add_forecast_core_features(df: pd.DataFrame) -> pd.DataFrame:
     out["stress_ratio"] = out["load_forecast"] / (out["wind_forecast"] + 1000.0)
     out["stress_ratio_1819"] = out["stress_ratio"] * out["is_18_19"]
     out["residual_load_1819"] = out["residual_load"] * out["is_18_19"]
+    out["net_load_share"] = out["residual_load"] / (out["load_forecast"] + 1e-6)
+    out["wind_share"] = out["wind_forecast"] / (out["load_forecast"] + 1e-6)
+    out["solar_share"] = out["solar_forecast"] / (out["load_forecast"] + 1e-6)
+    out["stress_ratio_sq"] = out["stress_ratio"] ** 2
+    out["residual_load_sq"] = out["residual_load"] ** 2
     return out
 
 
@@ -64,9 +72,76 @@ def add_forecast_lag_features(df: pd.DataFrame) -> pd.DataFrame:
         out[f"{c}_diff_24"] = out[c] - g.shift(24)
         shifted = g.shift(1)
         for w in roll_windows:
-            out[f"{c}_roll_mean_{w}"] = shifted.rolling(w, min_periods=1).mean()
-            out[f"{c}_roll_std_{w}"] = shifted.rolling(w, min_periods=2).std()
+            out[f"{c}_roll_mean_{w}"] = shifted.groupby(out["market"]).transform(
+                lambda s: s.rolling(w, min_periods=1).mean()
+            )
+            out[f"{c}_roll_std_{w}"] = shifted.groupby(out["market"]).transform(
+                lambda s: s.rolling(w, min_periods=2).std()
+            )
 
+    return out
+
+
+def add_meteo_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    if {"wind_gust_speed_10m", "wind_speed_10m"}.issubset(out.columns):
+        out["gustiness_10m"] = out["wind_gust_speed_10m"] - out["wind_speed_10m"]
+        out["gust_ratio_10m"] = out["wind_gust_speed_10m"] / (out["wind_speed_10m"] + 1e-6)
+    if {"wind_speed_80m", "wind_speed_10m"}.issubset(out.columns):
+        out["ws_ratio_80_10"] = out["wind_speed_80m"] / (out["wind_speed_10m"] + 1e-6)
+    if "wind_direction_80m" in out.columns:
+        out["wind_dir_sin"] = np.sin(np.deg2rad(out["wind_direction_80m"]))
+        out["wind_dir_cos"] = np.cos(np.deg2rad(out["wind_direction_80m"]))
+
+    if {"direct_normal_irradiance", "global_horizontal_irradiance"}.issubset(out.columns):
+        out["clear_sky_proxy"] = out["direct_normal_irradiance"] / (
+            out["global_horizontal_irradiance"] + 1e-6
+        )
+    if {"cloud_cover_low", "cloud_cover_total"}.issubset(out.columns):
+        out["cloud_low_share"] = out["cloud_cover_low"] / (out["cloud_cover_total"] + 1e-6)
+
+    if {"air_temperature_2m", "dew_point_temperature_2m"}.issubset(out.columns):
+        out["temp_dew_spread"] = out["air_temperature_2m"] - out["dew_point_temperature_2m"]
+    if {"air_temperature_2m", "apparent_temperature_2m"}.issubset(out.columns):
+        out["temp_apparent_gap"] = out["apparent_temperature_2m"] - out["air_temperature_2m"]
+
+    if {"wind_speed_80m", "residual_load"}.issubset(out.columns):
+        out["wind80_x_residual_load"] = out["wind_speed_80m"] * out["residual_load"]
+    if {"cloud_cover_total", "solar_forecast"}.issubset(out.columns):
+        out["cloud_x_solar"] = out["cloud_cover_total"] * out["solar_forecast"]
+
+    return out
+
+
+def add_missingness_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    core_cols = {
+        "id",
+        "target",
+        "market",
+        "delivery_start",
+        "delivery_end",
+        "load_forecast",
+        "wind_forecast",
+        "solar_forecast",
+        "_is_train",
+    }
+    meteo_cols = [c for c in out.columns if c not in core_cols]
+    if meteo_cols:
+        out["meteo_missing_count"] = out[meteo_cols].isna().sum(axis=1)
+        out["meteo_missing_any"] = (out["meteo_missing_count"] > 0).astype(int)
+    else:
+        out["meteo_missing_count"] = 0
+        out["meteo_missing_any"] = 0
+    return out
+
+
+def add_market_categorical_interactions(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["hour_x_market"] = out["hour"].astype(str) + "_" + out["market"].astype(str)
+    out["dow_x_market"] = out["dow"].astype(str) + "_" + out["market"].astype(str)
+    out["month_x_market"] = out["month"].astype(str) + "_" + out["market"].astype(str)
     return out
 
 
@@ -77,6 +152,10 @@ def add_cross_market_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     out = df.copy()
     cross_cols = [
+        "load_forecast",
+        "wind_forecast",
+        "solar_forecast",
+        "residual_load",
         "wind_speed_80m",
         "air_temperature_2m",
         "cloud_cover_total",
@@ -204,7 +283,10 @@ def build_feature_table(train_df: pd.DataFrame, test_df: pd.DataFrame) -> tuple[
     all_df = add_time_features(all_df)
     all_df = add_forecast_core_features(all_df)
     all_df = add_forecast_lag_features(all_df)
+    all_df = add_meteo_features(all_df)
     all_df = add_cross_market_features(all_df)
+    all_df = add_missingness_features(all_df)
+    all_df = add_market_categorical_interactions(all_df)
 
     train_out = all_df.loc[all_df["_is_train"] == 1].drop(columns=["_is_train"]).copy()
     test_out = all_df.loc[all_df["_is_train"] == 0].drop(columns=["_is_train", "target"], errors="ignore").copy()
@@ -235,7 +317,11 @@ def main() -> None:
 
     base_drop = {"id", "target", "delivery_start", "delivery_end"}
     candidate_features = [c for c in train_feat.columns if c not in base_drop]
-    cat_cols = [c for c in ["market"] if c in candidate_features]
+    cat_cols = [
+        c
+        for c in ["market", "hour_x_market", "dow_x_market", "month_x_market"]
+        if c in candidate_features
+    ]
 
     artifacts = train_global_and_local_models(train_feat, candidate_features, cat_cols)
 

@@ -10,6 +10,7 @@ import sys
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier, CatBoostRegressor
+import plotly.express as px
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error
@@ -125,6 +126,52 @@ def _append_experiment_registry(registry_path: Path, row: dict[str, str]) -> Non
         if needs_header:
             writer.writeheader()
         writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def _accumulate_catboost_feature_importance(
+    feature_importance_sum: dict[str, float],
+    feature_importance_weight: dict[str, float],
+    model: CatBoostRegressor,
+    feature_names: list[str],
+    weight: float = 1.0,
+) -> None:
+    importances = model.get_feature_importance(type="PredictionValuesChange")
+    for feature_name, importance in zip(feature_names, importances):
+        feature_importance_sum[feature_name] = feature_importance_sum.get(feature_name, 0.0) + float(importance) * weight
+        feature_importance_weight[feature_name] = feature_importance_weight.get(feature_name, 0.0) + weight
+
+
+def _save_feature_importance_artifacts(
+    run_dir: Path,
+    feature_importance_sum: dict[str, float],
+    feature_importance_weight: dict[str, float],
+) -> tuple[Path, Path] | None:
+    if not feature_importance_sum:
+        return None
+
+    rows = []
+    for feature_name, total_value in feature_importance_sum.items():
+        total_weight = feature_importance_weight.get(feature_name, 1.0)
+        mean_value = total_value / max(total_weight, 1e-9)
+        rows.append({"feature": feature_name, "importance": mean_value})
+
+    importance_df = pd.DataFrame(rows).sort_values("importance", ascending=False).reset_index(drop=True)
+    csv_path = run_dir / "feature_importance.csv"
+    html_path = run_dir / "feature_importance.html"
+    importance_df.to_csv(csv_path, index=False)
+
+    top_n = min(40, len(importance_df))
+    chart_df = importance_df.head(top_n).iloc[::-1]
+    fig = px.bar(
+        chart_df,
+        x="importance",
+        y="feature",
+        orientation="h",
+        title=f"Top {top_n} Feature Importances (CatBoost Aggregate)",
+    )
+    fig.update_layout(height=max(500, 20 * top_n))
+    fig.write_html(str(html_path), include_plotlyjs="cdn")
+    return csv_path, html_path
 
 
 def _add_harmonics(df: pd.DataFrame, column: str, period: int, harmonics: tuple[int, ...] = (1, 2, 3)) -> None:
@@ -373,6 +420,178 @@ def add_exogenous_lag_block(
     return train_out, test_out
 
 
+def add_op_features(train_df: pd.DataFrame, test_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    train_aug = train_df.copy()
+    test_aug = test_df.copy()
+
+    demand_col = "demand_forecast" if "demand_forecast" in train_aug.columns else "load_forecast"
+    core_exog = [col for col in [demand_col, "wind_forecast", "solar_forecast", "net_load", "residual_load"] if col in train_aug.columns]
+    weather_cols = [
+        col
+        for col in [
+            "air_temperature_2m",
+            "apparent_temperature_2m",
+            "cloud_cover_total",
+            "wind_speed_80m",
+            "global_horizontal_irradiance",
+        ]
+        if col in train_aug.columns
+    ]
+
+    # Nonlinear transforms that often capture convex price response in stressed regimes.
+    for df in [train_aug, test_aug]:
+        if "net_load" in df.columns:
+            net_load = df["net_load"].astype(float)
+            df["net_load_abs"] = np.abs(net_load)
+            df["net_load_sq"] = net_load * net_load
+            if "delivery_start_hour" in df.columns:
+                df["net_load_x_hour"] = net_load * df["delivery_start_hour"].astype(float)
+            if "delivery_start_is_weekend" in df.columns:
+                df["net_load_x_weekend"] = net_load * df["delivery_start_is_weekend"].astype(float)
+
+        if "wind_forecast" in df.columns:
+            wind = df["wind_forecast"].astype(float)
+            df["wind_forecast_sq"] = wind * wind
+            df["wind_forecast_cu"] = wind * wind * wind
+
+        if "solar_forecast" in df.columns:
+            solar = df["solar_forecast"].astype(float)
+            df["solar_forecast_sq"] = solar * solar
+            df["solar_forecast_log1p"] = np.log1p(np.clip(solar, a_min=0.0, a_max=None))
+
+        if {"wind_forecast", "solar_forecast", demand_col}.issubset(df.columns):
+            demand = df[demand_col].astype(float)
+            renew = df["wind_forecast"].astype(float) + df["solar_forecast"].astype(float)
+            df["renewable_share"] = renew / (np.abs(demand) + 1e-3)
+            df["renewable_minus_demand"] = renew - demand
+
+        if {"solar_forecast", "cloud_cover_total"}.issubset(df.columns):
+            cloud = np.clip(df["cloud_cover_total"].astype(float), 0.0, 100.0)
+            df["solar_cloud_adj"] = df["solar_forecast"].astype(float) * (1.0 - cloud / 100.0)
+
+        if {"air_temperature_2m", "apparent_temperature_2m"}.issubset(df.columns):
+            temp = df["air_temperature_2m"].astype(float)
+            app = df["apparent_temperature_2m"].astype(float)
+            df["temp_abs"] = np.abs(temp)
+            df["temp_apparent_abs_gap"] = np.abs(temp - app)
+
+    # Cross-market pressure features at each timestamp (known for both train/test).
+    for df in [train_aug, test_aug]:
+        if "delivery_start_ts" not in df.columns:
+            continue
+        for col in core_exog:
+            grp = df.groupby("delivery_start_ts", sort=False)[col]
+            ts_mean = grp.transform("mean")
+            ts_std = grp.transform("std")
+            df[f"{col}_cs_delta_mean"] = df[col].astype(float) - ts_mean
+            df[f"{col}_cs_z"] = (df[col].astype(float) - ts_mean) / (ts_std.fillna(0.0) + 1e-3)
+            df[f"{col}_cs_rank_pct"] = grp.rank(pct=True)
+
+    # Market-hour baseline deviations computed from training set only.
+    key_cols = ["market", "delivery_start_hour", "delivery_start_dow"]
+    if all(col in train_aug.columns for col in key_cols):
+        baseline_cols = core_exog + weather_cols
+        for col in baseline_cols:
+            stats = (
+                train_aug.groupby(key_cols, as_index=False)[col]
+                .agg(
+                    **{
+                        f"{col}_mhd_mean": "mean",
+                        f"{col}_mhd_std": "std",
+                    }
+                )
+            )
+            train_aug = train_aug.merge(stats, on=key_cols, how="left")
+            test_aug = test_aug.merge(stats, on=key_cols, how="left")
+
+            for df in [train_aug, test_aug]:
+                mean_col = f"{col}_mhd_mean"
+                std_col = f"{col}_mhd_std"
+                df[f"{col}_mhd_delta"] = df[col].astype(float) - df[mean_col].astype(float)
+                df[f"{col}_mhd_z"] = df[f"{col}_mhd_delta"] / (df[std_col].astype(float).fillna(0.0) + 1e-3)
+
+    # Train-derived market quantile regime flags.
+    if "net_load" in train_aug.columns:
+        q_low = train_aug.groupby("market")["net_load"].quantile(0.10).to_dict()
+        q_high = train_aug.groupby("market")["net_load"].quantile(0.90).to_dict()
+        q_mid_hi = train_aug.groupby("market")["net_load"].quantile(0.75).to_dict()
+        for df in [train_aug, test_aug]:
+            net = df["net_load"].astype(float)
+            low = df["market"].map(q_low).astype(float)
+            high = df["market"].map(q_high).astype(float)
+            mid_hi = df["market"].map(q_mid_hi).astype(float)
+            df["is_low_net_load_regime"] = (net <= low).astype(int)
+            df["is_high_net_load_regime"] = (net >= high).astype(int)
+            df["net_load_tail_up"] = np.clip(net - high, a_min=0.0, a_max=None)
+            df["net_load_tail_down"] = np.clip(low - net, a_min=0.0, a_max=None)
+            df["is_mid_high_net_load"] = (net >= mid_hi).astype(int)
+
+    # Creative dummies and interactions for intraday structure.
+    for df in [train_aug, test_aug]:
+        if "delivery_start_hour" in df.columns:
+            hour = pd.to_numeric(df["delivery_start_hour"], errors="coerce").fillna(0).astype(int)
+            df["is_morning_peak"] = hour.isin([7, 8, 9]).astype(int)
+            df["is_evening_peak"] = hour.isin([17, 18, 19, 20]).astype(int)
+            df["is_night_block"] = hour.isin([0, 1, 2, 3, 4, 5]).astype(int)
+            df["is_midday_solar"] = hour.isin([11, 12, 13, 14]).astype(int)
+            df["is_shoulder_hour"] = hour.isin([6, 10, 15, 16, 21, 22]).astype(int)
+
+        if "delivery_start_dow" in df.columns:
+            dow = pd.to_numeric(df["delivery_start_dow"], errors="coerce").fillna(0).astype(int)
+            df["is_monday"] = (dow == 0).astype(int)
+            df["is_friday"] = (dow == 4).astype(int)
+            df["is_weekend_adjacent"] = dow.isin([0, 4]).astype(int)
+
+        if {"is_morning_peak", "is_evening_peak", "net_load"}.issubset(df.columns):
+            net = df["net_load"].astype(float)
+            df["net_load_x_morning_peak"] = net * df["is_morning_peak"].astype(float)
+            df["net_load_x_evening_peak"] = net * df["is_evening_peak"].astype(float)
+            if "is_high_net_load_regime" in df.columns:
+                df["is_peak_and_high_net"] = (
+                    (df["is_morning_peak"] == 1) | (df["is_evening_peak"] == 1)
+                ).astype(int) * df["is_high_net_load_regime"].astype(int)
+
+        if {"wind_forecast", "solar_forecast", demand_col}.issubset(df.columns):
+            demand = df[demand_col].astype(float)
+            wind = df["wind_forecast"].astype(float)
+            solar = df["solar_forecast"].astype(float)
+            df["demand_minus_wind"] = demand - wind
+            df["demand_minus_solar"] = demand - solar
+            df["wind_minus_solar"] = wind - solar
+            df["demand_x_renewable_share"] = demand * df.get("renewable_share", 0.0)
+
+        if {"delivery_start_hour", "solar_forecast"}.issubset(df.columns):
+            hour = pd.to_numeric(df["delivery_start_hour"], errors="coerce").fillna(0).astype(float)
+            solar = df["solar_forecast"].astype(float)
+            df["solar_x_hour"] = solar * hour
+            if "is_midday_solar" in df.columns:
+                df["solar_x_midday_dummy"] = solar * df["is_midday_solar"].astype(float)
+
+        if {"delivery_start_hour", "wind_forecast"}.issubset(df.columns):
+            hour = pd.to_numeric(df["delivery_start_hour"], errors="coerce").fillna(0).astype(float)
+            df["wind_x_hour"] = df["wind_forecast"].astype(float) * hour
+
+        if {"is_weekend_adjacent", "net_load"}.issubset(df.columns):
+            df["net_load_x_weekend_adjacent"] = (
+                df["net_load"].astype(float) * df["is_weekend_adjacent"].astype(float)
+            )
+
+    # Cross-market top/bottom pressure dummies (timestamp-level relative extremes).
+    for df in [train_aug, test_aug]:
+        if "delivery_start_ts" not in df.columns:
+            continue
+        for col in ["net_load", demand_col, "wind_forecast", "solar_forecast"]:
+            if col not in df.columns:
+                continue
+            rank = df.groupby("delivery_start_ts", sort=False)[col].rank(pct=True)
+            df[f"is_top10_{col}"] = (rank >= 0.90).astype(int)
+            df[f"is_bottom10_{col}"] = (rank <= 0.10).astype(int)
+
+    train_aug = train_aug.sort_values(["delivery_start_ts", "market", "id"]).reset_index(drop=True)
+    test_aug = test_aug.sort_values(["delivery_start_ts", "market", "id"]).reset_index(drop=True)
+    return train_aug, test_aug
+
+
 def add_test_base_features(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy().sort_values(["market", "delivery_start_ts", "id"]).reset_index(drop=True)
 
@@ -451,17 +670,27 @@ def _fit_ridge_baseline(
     if not numeric_cols:
         return {"kind": "constant", "mean": float(y_train.mean()), "cols": [], "fill": {}}
 
-    fill = {col: float(x_train[col].median()) for col in numeric_cols}
-    x_mat = x_train[numeric_cols].copy()
-    for col, val in fill.items():
-        x_mat[col] = x_mat[col].fillna(val)
+    baseline_mean = float(y_train.mean())
+    x_mat = x_train[numeric_cols].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    fill: dict[str, float] = {}
+    for col in numeric_cols:
+        median_val = x_mat[col].median()
+        if not np.isfinite(median_val):
+            median_val = 0.0
+        fill[col] = float(median_val)
+        x_mat[col] = x_mat[col].fillna(fill[col])
+    x_mat = x_mat.clip(lower=-1e7, upper=1e7)
 
     model = make_pipeline(
         StandardScaler(),
-        Ridge(alpha=25.0, solver="svd"),
+        Ridge(alpha=25.0, solver="auto"),
     )
-    model.fit(x_mat, y_train)
-    return {"kind": "ridge", "model": model, "cols": numeric_cols, "fill": fill}
+    try:
+        model.fit(x_mat, y_train)
+    except Exception as exc:
+        print(f"Warning: ridge baseline failed ({exc}); falling back to constant baseline.")
+        return {"kind": "constant", "mean": baseline_mean, "cols": [], "fill": {}}
+    return {"kind": "ridge", "model": model, "cols": numeric_cols, "fill": fill, "mean": baseline_mean}
 
 
 def _predict_baseline(
@@ -474,11 +703,16 @@ def _predict_baseline(
     cols: list[str] = baseline["cols"]  # type: ignore[assignment]
     fill: dict[str, float] = baseline["fill"]  # type: ignore[assignment]
     model = baseline["model"]  # type: ignore[assignment]
+    baseline_mean = float(baseline.get("mean", 0.0))
 
-    x_mat = x_df[cols].copy()
+    x_mat = x_df[cols].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
     for col, val in fill.items():
         x_mat[col] = x_mat[col].fillna(val)
-    return model.predict(x_mat)
+    x_mat = x_mat.clip(lower=-1e7, upper=1e7)
+    pred = np.asarray(model.predict(x_mat), dtype=float)
+    if not np.all(np.isfinite(pred)):
+        pred = np.nan_to_num(pred, nan=baseline_mean, posinf=baseline_mean, neginf=baseline_mean)
+    return pred
 
 
 def _fit_market_models(
@@ -525,6 +759,10 @@ def _fit_market_models(
     peak_depth = 7 if fast_dev else 8
     peak_es_rounds = 120 if fast_dev else 220
     peak_clf_iterations = 320 if fast_dev else 900
+    specialist_iterations = 700 if fast_dev else 2000
+    specialist_lr = 0.04 if fast_dev else 0.025
+    specialist_depth = 7 if fast_dev else 8
+    specialist_es_rounds = 80 if fast_dev else 180
     hgb_max_iter = 250 if fast_dev else 700
     hgb_depth = 6 if fast_dev else 7
 
@@ -645,6 +883,64 @@ def _fit_market_models(
     cat_spike_valid = np.asarray(cat_spike.predict(x_valid), dtype=float)
     cat_peak_valid = np.asarray(cat_peak.predict(x_valid), dtype=float)
 
+    peak_hour_model: CatBoostRegressor | None = None
+    weekend_model: CatBoostRegressor | None = None
+    cat_peak_hour_valid = cat_normal_valid.copy()
+    cat_weekend_valid = cat_normal_valid.copy()
+
+    if "delivery_start_hour" in x_train.columns:
+        hour_train = pd.to_numeric(x_train["delivery_start_hour"], errors="coerce")
+        peak_hour_mask = hour_train.isin([7, 8, 9, 17, 18, 19]).to_numpy()
+        if int(np.sum(peak_hour_mask)) >= 240:
+            peak_hour_model = CatBoostRegressor(
+                loss_function="RMSE",
+                eval_metric="RMSE",
+                iterations=specialist_iterations,
+                learning_rate=specialist_lr,
+                depth=specialist_depth,
+                l2_leaf_reg=22,
+                bagging_temperature=0.6,
+                random_strength=0.9,
+                random_seed=seed + 211,
+                verbose=0,
+                **catboost_device_params,
+            )
+            peak_hour_model.fit(
+                x_train.loc[peak_hour_mask],
+                y_train.loc[peak_hour_mask],
+                cat_features=cat_cols,
+                eval_set=(x_valid, y_valid),
+                use_best_model=True,
+                early_stopping_rounds=specialist_es_rounds,
+            )
+            cat_peak_hour_valid = np.asarray(peak_hour_model.predict(x_valid), dtype=float)
+
+    if "delivery_start_is_weekend" in x_train.columns:
+        weekend_mask = (pd.to_numeric(x_train["delivery_start_is_weekend"], errors="coerce").fillna(0).astype(int) == 1).to_numpy()
+        if int(np.sum(weekend_mask)) >= 200:
+            weekend_model = CatBoostRegressor(
+                loss_function="RMSE",
+                eval_metric="RMSE",
+                iterations=specialist_iterations,
+                learning_rate=specialist_lr,
+                depth=specialist_depth,
+                l2_leaf_reg=22,
+                bagging_temperature=0.6,
+                random_strength=0.9,
+                random_seed=seed + 223,
+                verbose=0,
+                **catboost_device_params,
+            )
+            weekend_model.fit(
+                x_train.loc[weekend_mask],
+                y_train.loc[weekend_mask],
+                cat_features=cat_cols,
+                eval_set=(x_valid, y_valid),
+                use_best_model=True,
+                early_stopping_rounds=specialist_es_rounds,
+            )
+            cat_weekend_valid = np.asarray(weekend_model.predict(x_valid), dtype=float)
+
     hgb = HistGradientBoostingRegressor(
         learning_rate=0.04,
         max_depth=hgb_depth,
@@ -660,6 +956,8 @@ def _fit_market_models(
         "cat_normal": cat_normal,
         "cat_spike": cat_spike,
         "cat_peak": cat_peak,
+        "cat_peak_hour": peak_hour_model,
+        "cat_weekend": weekend_model,
         "spike_classifier": spike_classifier,
         "peak_classifier": peak_classifier,
         "hgb": hgb,
@@ -671,6 +969,8 @@ def _fit_market_models(
         "cat_normal": cat_normal_valid,
         "cat_spike": cat_spike_valid,
         "cat_peak": cat_peak_valid,
+        "cat_peak_hour": cat_peak_hour_valid,
+        "cat_weekend": cat_weekend_valid,
         "hgb": hgb_valid,
         "p_spike": p_spike_valid,
         "p_peak": p_peak_valid,
@@ -686,6 +986,8 @@ def _predict_model_components(
     cat_normal: CatBoostRegressor = models["cat_normal"]  # type: ignore[assignment]
     cat_spike: CatBoostRegressor = models["cat_spike"]  # type: ignore[assignment]
     cat_peak: CatBoostRegressor = models["cat_peak"]  # type: ignore[assignment]
+    cat_peak_hour: CatBoostRegressor | None = models["cat_peak_hour"]  # type: ignore[assignment]
+    cat_weekend: CatBoostRegressor | None = models["cat_weekend"]  # type: ignore[assignment]
     spike_classifier: CatBoostClassifier | None = models["spike_classifier"]  # type: ignore[assignment]
     peak_classifier: CatBoostClassifier | None = models["peak_classifier"]  # type: ignore[assignment]
     hgb: HistGradientBoostingRegressor = models["hgb"]  # type: ignore[assignment]
@@ -693,6 +995,8 @@ def _predict_model_components(
     cat_normal_pred = float(cat_normal.predict(row_df)[0])
     cat_spike_pred = float(cat_spike.predict(row_df)[0])
     cat_peak_pred = float(cat_peak.predict(row_df)[0])
+    cat_peak_hour_pred = float(cat_peak_hour.predict(row_df)[0]) if cat_peak_hour is not None else cat_normal_pred
+    cat_weekend_pred = float(cat_weekend.predict(row_df)[0]) if cat_weekend is not None else cat_normal_pred
 
     if spike_classifier is not None:
         p_spike = float(spike_classifier.predict_proba(row_df)[:, 1][0])
@@ -708,6 +1012,8 @@ def _predict_model_components(
         "cat_normal": cat_normal_pred,
         "cat_spike": cat_spike_pred,
         "cat_peak": cat_peak_pred,
+        "cat_peak_hour": cat_peak_hour_pred,
+        "cat_weekend": cat_weekend_pred,
         "hgb": hgb_pred,
         "p_spike": float(np.clip(p_spike, 0.0, 1.0)),
         "p_peak": float(np.clip(p_peak, 0.0, 1.0)),
@@ -718,6 +1024,8 @@ def _build_meta_matrix(
     cat_normal: np.ndarray,
     cat_spike: np.ndarray,
     cat_peak: np.ndarray,
+    cat_peak_hour: np.ndarray,
+    cat_weekend: np.ndarray,
     hgb: np.ndarray,
     p_spike: np.ndarray,
     p_peak: np.ndarray,
@@ -727,6 +1035,8 @@ def _build_meta_matrix(
             cat_normal,
             cat_spike,
             cat_peak,
+            cat_peak_hour,
+            cat_weekend,
             hgb,
             p_spike,
             p_peak,
@@ -743,6 +1053,8 @@ def _stack_residual_prediction(
         cat_normal=np.array([components["cat_normal"]], dtype=float),
         cat_spike=np.array([components["cat_spike"]], dtype=float),
         cat_peak=np.array([components["cat_peak"]], dtype=float),
+        cat_peak_hour=np.array([components["cat_peak_hour"]], dtype=float),
+        cat_weekend=np.array([components["cat_weekend"]], dtype=float),
         hgb=np.array([components["hgb"]], dtype=float),
         p_spike=np.array([components["p_spike"]], dtype=float),
         p_peak=np.array([components["p_peak"]], dtype=float),
@@ -978,7 +1290,8 @@ def run_with_ledger(
             test_df = add_time_features(test_df)
 
             train_df, test_df = add_residual_load_features(train_df, test_df)
-            train_df, test_df = add_exogenous_lag_block(train_df, test_df)
+            train_df, test_df = add_exogenous_lag_block(train_df, test_df, enabled_markets={"Market B"})
+            train_df, test_df = add_op_features(train_df, test_df)
 
             train_df = add_train_lag_features(train_df)
             test_df = add_test_base_features(test_df)
@@ -1062,6 +1375,9 @@ def run_with_ledger(
                     "Global model may be weak in early folds."
                 )
 
+            feature_importance_sum: dict[str, float] = {}
+            feature_importance_weight: dict[str, float] = {}
+
             final_global_device_params: dict[str, str] = {}
             if bool(config["use_gpu"]):
                 final_global_device_params = {
@@ -1087,6 +1403,13 @@ def run_with_ledger(
                 train_df["target"],
                 cat_features=direct_cat_cols,
             )
+            _accumulate_catboost_feature_importance(
+                feature_importance_sum=feature_importance_sum,
+                feature_importance_weight=feature_importance_weight,
+                model=final_global_model,
+                feature_names=direct_feature_cols,
+                weight=1.0,
+            )
             global_test_pred = np.asarray(final_global_model.predict(global_test_x), dtype=float)
 
             print(f"Run ID: {run_id}")
@@ -1101,7 +1424,7 @@ def run_with_ledger(
                 "then long-horizon expert"
             )
             print("Blending mode: residual baseline + OOF stacker + global/local signal")
-            print("Experts: normal + spike + peak (soft-gated)")
+            print("Experts: normal + spike + peak + time specialists (soft-gated)")
 
             predictions_by_id: dict[int, float] = {}
             market_scores: list[tuple[str, float]] = []
@@ -1139,6 +1462,8 @@ def run_with_ledger(
                 oof_cat_normal = np.full(len(market_train), np.nan, dtype=float)
                 oof_cat_spike = np.full(len(market_train), np.nan, dtype=float)
                 oof_cat_peak = np.full(len(market_train), np.nan, dtype=float)
+                oof_cat_peak_hour = np.full(len(market_train), np.nan, dtype=float)
+                oof_cat_weekend = np.full(len(market_train), np.nan, dtype=float)
                 oof_hgb = np.full(len(market_train), np.nan, dtype=float)
                 oof_p_spike = np.full(len(market_train), np.nan, dtype=float)
                 oof_p_peak = np.full(len(market_train), np.nan, dtype=float)
@@ -1176,6 +1501,8 @@ def run_with_ledger(
                     cat_normal_pred = np.asarray(valid_outputs["cat_normal"], dtype=float)
                     cat_spike_pred = np.asarray(valid_outputs["cat_spike"], dtype=float)
                     cat_peak_pred = np.asarray(valid_outputs["cat_peak"], dtype=float)
+                    cat_peak_hour_pred = np.asarray(valid_outputs["cat_peak_hour"], dtype=float)
+                    cat_weekend_pred = np.asarray(valid_outputs["cat_weekend"], dtype=float)
                     hgb_pred = np.asarray(valid_outputs["hgb"], dtype=float)
                     p_spike_pred = np.asarray(valid_outputs["p_spike"], dtype=float)
                     p_peak_pred = np.asarray(valid_outputs["p_peak"], dtype=float)
@@ -1184,14 +1511,18 @@ def run_with_ledger(
                     oof_cat_normal[valid_idx] = cat_normal_pred
                     oof_cat_spike[valid_idx] = cat_spike_pred
                     oof_cat_peak[valid_idx] = cat_peak_pred
+                    oof_cat_peak_hour[valid_idx] = cat_peak_hour_pred
+                    oof_cat_weekend[valid_idx] = cat_weekend_pred
                     oof_hgb[valid_idx] = hgb_pred
                     oof_p_spike[valid_idx] = p_spike_pred
                     oof_p_peak[valid_idx] = p_peak_pred
 
                     fold_blend = baseline_valid + (
-                        0.35 * (p_spike_pred * cat_spike_pred + (1.0 - p_spike_pred) * cat_normal_pred)
-                        + 0.35 * hgb_pred
-                        + 0.30 * (p_peak_pred * cat_peak_pred + (1.0 - p_peak_pred) * cat_normal_pred)
+                        0.25 * (p_spike_pred * cat_spike_pred + (1.0 - p_spike_pred) * cat_normal_pred)
+                        + 0.25 * hgb_pred
+                        + 0.25 * (p_peak_pred * cat_peak_pred + (1.0 - p_peak_pred) * cat_normal_pred)
+                        + 0.15 * cat_peak_hour_pred
+                        + 0.10 * cat_weekend_pred
                     )
                     rmse_fold = float(mean_squared_error(y_valid, fold_blend) ** 0.5)
                     fold_records.append(
@@ -1221,6 +1552,8 @@ def run_with_ledger(
                     & (~np.isnan(oof_cat_normal))
                     & (~np.isnan(oof_cat_spike))
                     & (~np.isnan(oof_cat_peak))
+                    & (~np.isnan(oof_cat_peak_hour))
+                    & (~np.isnan(oof_cat_weekend))
                     & (~np.isnan(oof_hgb))
                     & (~np.isnan(oof_p_spike))
                     & (~np.isnan(oof_p_peak))
@@ -1232,6 +1565,8 @@ def run_with_ledger(
                     cat_normal=oof_cat_normal[valid_mask],
                     cat_spike=oof_cat_spike[valid_mask],
                     cat_peak=oof_cat_peak[valid_mask],
+                    cat_peak_hour=oof_cat_peak_hour[valid_mask],
+                    cat_weekend=oof_cat_weekend[valid_mask],
                     hgb=oof_hgb[valid_mask],
                     p_spike=oof_p_spike[valid_mask],
                     p_peak=oof_p_peak[valid_mask],
@@ -1306,6 +1641,41 @@ def run_with_ledger(
                     gpu_devices=str(config["gpu_devices"]),
                     fast_dev=bool(config["fast_dev"]),
                 )
+                _accumulate_catboost_feature_importance(
+                    feature_importance_sum=feature_importance_sum,
+                    feature_importance_weight=feature_importance_weight,
+                    model=final_models["cat_normal"],
+                    feature_names=feature_cols,
+                    weight=1.0,
+                )
+                _accumulate_catboost_feature_importance(
+                    feature_importance_sum=feature_importance_sum,
+                    feature_importance_weight=feature_importance_weight,
+                    model=final_models["cat_spike"],
+                    feature_names=feature_cols,
+                    weight=0.8,
+                )
+                _accumulate_catboost_feature_importance(
+                    feature_importance_sum=feature_importance_sum,
+                    feature_importance_weight=feature_importance_weight,
+                    model=final_models["cat_peak"],
+                    feature_names=feature_cols,
+                    weight=0.6,
+                )
+                _accumulate_catboost_feature_importance(
+                    feature_importance_sum=feature_importance_sum,
+                    feature_importance_weight=feature_importance_weight,
+                    model=final_models["cat_peak_hour"],
+                    feature_names=feature_cols,
+                    weight=0.5,
+                )
+                _accumulate_catboost_feature_importance(
+                    feature_importance_sum=feature_importance_sum,
+                    feature_importance_weight=feature_importance_weight,
+                    model=final_models["cat_weekend"],
+                    feature_names=feature_cols,
+                    weight=0.5,
+                )
 
                 recent_fraction = float(config["mid_expert_recent_fraction"])
                 recent_fraction = min(max(recent_fraction, 0.15), 0.90)
@@ -1329,6 +1699,13 @@ def run_with_ledger(
                     gpu_devices=str(config["gpu_devices"]),
                     fast_dev=bool(config["fast_dev"]),
                 )
+                _accumulate_catboost_feature_importance(
+                    feature_importance_sum=feature_importance_sum,
+                    feature_importance_weight=feature_importance_weight,
+                    model=final_direct_mid_models["cat_normal"],
+                    feature_names=direct_feature_cols,
+                    weight=0.7,
+                )
 
                 final_direct_long_models, _ = _fit_market_models(
                     x_train=x_fit[direct_feature_cols],
@@ -1341,6 +1718,13 @@ def run_with_ledger(
                     use_gpu=bool(config["use_gpu"]),
                     gpu_devices=str(config["gpu_devices"]),
                     fast_dev=bool(config["fast_dev"]),
+                )
+                _accumulate_catboost_feature_importance(
+                    feature_importance_sum=feature_importance_sum,
+                    feature_importance_weight=feature_importance_weight,
+                    model=final_direct_long_models["cat_normal"],
+                    feature_names=direct_feature_cols,
+                    weight=0.9,
                 )
 
                 num_fill_values = {col: float(market_train[col].median()) for col in numeric_cols}
@@ -1412,6 +1796,19 @@ def run_with_ledger(
 
             model_manifest_path.write_text("\n".join(model_manifest_rows) + "\n", encoding="utf-8")
 
+            feature_importance_paths = _save_feature_importance_artifacts(
+                run_dir=run_dir,
+                feature_importance_sum=feature_importance_sum,
+                feature_importance_weight=feature_importance_weight,
+            )
+            if feature_importance_paths is not None:
+                feature_importance_csv_path, feature_importance_html_path = feature_importance_paths
+                print(f"Saved feature importance CSV: {feature_importance_csv_path}")
+                print(f"Saved feature importance graph: {feature_importance_html_path}")
+            else:
+                feature_importance_csv_path = None
+                feature_importance_html_path = None
+
             if market_scores:
                 print("Per-market CV RMSE (day folds):")
                 for market, score in sorted(market_scores, key=lambda x: x[1]):
@@ -1458,6 +1855,12 @@ def run_with_ledger(
                 "model_path": str(model_manifest_path),
                 "submission_path": str(submission_path),
                 "oof_path": str(oof_path),
+                "feature_importance_csv": (
+                    str(feature_importance_csv_path) if feature_importance_csv_path is not None else None
+                ),
+                "feature_importance_html": (
+                    str(feature_importance_html_path) if feature_importance_html_path is not None else None
+                ),
             }
             metrics_path.write_text(_stable_json(metrics) + "\n", encoding="utf-8")
 

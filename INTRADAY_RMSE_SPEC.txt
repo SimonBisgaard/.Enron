@@ -1,0 +1,288 @@
+Spec: Intraday Elpris Forecast (RMSE)
+
+0) Mål og leverance
+
+Opgave: For hver række i test_for_participants.csv (hver time pr. market) forudsig target.
+Metric: RMSE på rå target.
+  - Squared error betyder at spikes/tails dominerer.
+Submission-format:
+  - submission.csv med kolonner:
+    - id (fra test)
+    - target (prediction)
+Vigtigt:
+  - id må ikke bruges som feature (praktisk leakage-risiko), men skal med i output.
+
+---
+
+1) Data: schema og observationer
+
+Filer og kolonner
+
+train.csv:
+  - id, target, market, meteo-features, 3 forecast-features, delivery_start, delivery_end.
+  - Tidsrum: 2023-01-01 00:00 til 2025-08-31 23:00.
+  - Markeder: Market A–F.
+test_for_participants.csv:
+  - Samme features minus target.
+  - Tidsrum: 2025-09-01 00:00 til 2025-11-30 22:00.
+
+Struktur
+
+Timefrekvens.
+Én række pr. (market, hour).
+
+Kritiske risici
+
+Heavy tails/spikes i target.
+Systematisk blok-missingness i test-meteo.
+Forecast-kolonner (load_forecast, wind_forecast, solar_forecast) er altid tilgængelige.
+Forecast-kolonner er “globale” pr. timestamp (identiske på tværs af markets).
+Stærke intraday/kalender-mønstre (især 18–19 stress-vindue).
+
+---
+
+2) Overordnet modelstrategi
+
+Mixture-of-experts pipeline
+
+1. Full model (regressor)
+Alle relevante features inkl. meteo.
+Bruges når meteo er tilgængelig.
+
+2. Fallback model (regressor, forecast-only)
+Features der altid er i test (forecast + kalender + market + engineered forecast/stress).
+Bruges ved meteo-missing.
+
+3. Spike module
+Spike classifier: estimerer p_spike.
+Valgfri spike uplift/magnitude regressor.
+
+Inference-logik
+
+Hvis meteo mangler: baseline = pred_fallback.
+Ellers: baseline = pred_full.
+Korrigering:
+  - pred_final = baseline + p_spike * uplift_pred
+  - eller soft-mixture mellem normal/spike eksperter.
+
+Princip
+
+Spike-modul skal primært være baseret på inference-safe features (forecast + kalender + stress), så det virker under meteo-missing.
+
+---
+
+3) Feature engineering (målbillede)
+
+3.1 Kalender og identitet
+
+hour, dow, month, is_weekend.
+RMSE-kritiske flags:
+  - is_peak_17_20
+  - is_18_19.
+market som kategorisk feature.
+Drop som modelinput: id, evt. delivery_end.
+
+3.2 Always-available forecast features
+
+Raw: load_forecast, wind_forecast, solar_forecast.
+Lags: 1,2,3,6,12,24,48,72,168.
+Diffs/ramps: 1,2,3,6,24.
+Rolling (past-only via shift(1)):
+  - means: 3,6,12,24,48,168
+  - std: 6,24
+  - max: 3,6,24
+  - valgfri min: 24
+is_night = (solar_forecast == 0).
+
+3.3 Vind-meteo
+
+wind_speed_80m, wind_speed_10m, wind_gust_speed_10m, wind_direction_80m.
+Engineered:
+  - gustiness_10m, gust_ratio_10m, ws_ratio_80_10
+  - wind_dir_sin, wind_dir_cos
+  - valgfri ws80 lag/diff/roll.
+
+3.4 Solar/cloud/irradiance
+
+Irradiance + cloud-lag.
+Engineered:
+  - clear_sky_proxy
+  - cloud_low_share.
+
+3.5 Temperatur/fugt
+
+Temp/humidity families + valgfri tail flags (hot, very_hot).
+
+3.6 Pressure/stability/convective
+
+surface_pressure, freezing_level_height, lifted_index, CAPE, CIN.
+
+3.7 Visibility/precip
+
+visibility, precipitation_amount, valgfri is_raining.
+
+3.8 Missingness-features
+
+meteo_missing_any, meteo_missing_count.
+Valgfri gruppe-flags (wind/solar meteo missing).
+
+3.9 Stress / residual / joint regimes
+
+residual_load = load_forecast - wind_forecast - solar_forecast.
+stress_ratio = load_forecast / (wind_forecast + 1000).
+Interaktioner med is_18_19 og is_night.
+Soft threshold features (fold-safe quantiles):
+  - excess_load_90, wind_deficit_10, stress_excess, stress_excess_1819.
+Ramp stress:
+  - neg_load_ramp_1, stress_ramp_1819.
+
+---
+
+4) Modelkomponenter og featurebrug
+
+4.1 Full regressor
+
+Bruger 3.1–3.9 + missingness.
+Formål: max performance når meteo findes.
+
+4.2 Fallback regressor
+
+Bruger forecast-only + kalender + market + stress.
+Må ikke bruge meteo.
+Formål: robusthed under test-missingness.
+
+4.3 Spike classifier
+
+Market-aware label (fx top-1% pr market per fold).
+Input: inference-safe features.
+Håndter imbalance via scale_pos_weight/is_unbalance.
+
+4.4 Spike uplift/magnitude
+
+Variant A: uplift (target - baseline_oof) på tail-subset.
+Variant B: separat spike regressor + mixture blend.
+
+---
+
+5) CV-design (dag-alignet, leak-safe)
+
+Expanding window.
+n_folds = 5.
+val_window = 14 dage.
+step = 14 dage.
+Split-grænser på hele dage (00:00).
+Train < val-start.
+
+Leak-safety
+
+Lags/rollings past-only (shift(1)).
+Quantile thresholds kun fra train-fold.
+Eventuel scaling: fit på train-fold.
+
+Evaluering pr fold
+
+Overall RMSE.
+RMSE pr market.
+RMSE i 18–19.
+RMSE i stress-slices.
+
+Missingness-realism (valgfrit)
+
+Syntetisk meteo-masking i val for at validere fallback-switch logik.
+
+---
+
+6) Anti-overfit / anti-kitchen-sink
+
+Feature-pakker i rækkefølge:
+  1. Core
+  2. Temporal
+  3. Stress
+  4. Meteo
+Conservative LightGBM regularisering.
+Early stopping.
+Gating fremfor én monolitisk model til både normal + spikes.
+Kalibrering af spike-sandsynligheder ved behov (OOF isotonic/Platt).
+
+---
+
+7) Meta-labelling til spike-korrektion
+
+Brug baseline OOF fejl til meta-label:
+  - fx abs(target - pred_base_oof) top X%.
+Træn classifier på meta-label.
+Brug p_meta til at styre uplift-aktivering:
+  - pred_final = baseline + p_meta * uplift_pred.
+
+---
+
+8) Merit-order / stack proxy uden leakage
+
+Brug ikke target-rolling i test medmindre competition format eksplicit frigiver targets løbende.
+Brug i stedet test-safe proxies:
+  - residual_load
+  - stress_ratio
+  - ramps
+  - regime-features
+Supplér med recency-modeling:
+  - sidste 12m / 6m varianter
+  - sample weighting mod nyere data.
+
+---
+
+9) Current project setup (det vi allerede har)
+
+Pipeline i repo (nuværende)
+
+Per-market træning med run ledger.
+Hybrid inference (recursive + direct horizon experts).
+Soft mixture med flere eksperter (normal/spike/peak + specials).
+Fallback-safe feature design prioriteres i centrale dele.
+
+Implementerede extensions i nuværende kode
+
+Exogenous lag block med lags/diffs/rollings.
+OP/creative featureblok med:
+  - cross-market pressure features
+  - nonlinear transforms
+  - market-hour deviation baselines
+  - regime dummies/interaktioner.
+Exogenous lag block gated til Market B (eksperimentelt).
+--exclude-2023 holder nu hale af 2023 (default fra oktober).
+
+Run documentation / reproducibility
+
+Hver run får run_id + mappe i runs/<run_id>/.
+Artefakter:
+  - train.log
+  - params.yaml
+  - metrics.json
+  - oof.csv
+  - submission.csv
+  - models_manifest.txt
+Registry: experiments.csv.
+metrics.json indeholder både overall og fold-diagnostik inkl. fold_rmse_mean_last2.
+
+Profiler
+
+Full mode: til endelig kandidat.
+Fast-dev mode: hurtig iteration/ablation, ikke endelig ranking alene.
+
+---
+
+10) Prioriteret execution-plan
+
+1. Stabil Full + Fallback + switch.
+2. Stress features (residual/stress/ramp).
+3. Spike classifier + simpel uplift.
+4. Strict ablation per featurepakke.
+5. Meta-label / calibration / advanced stacking først bagefter.
+
+---
+
+11) Acceptance criteria per ændring
+
+Forbedring i fold_rmse_mean_last2.
+Ingen markant forværring i fold_rmse_mean_worst.
+Flertal af markeder må ikke regressere hårdt.
+Endelig validering på public LB før promotion til champion.

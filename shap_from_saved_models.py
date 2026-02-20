@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 from pathlib import Path
 
@@ -8,7 +9,13 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor, Pool
 
-from train_per_market_interactions import apply_exclude_2023, build_feature_table
+from train_per_market_interactions import (
+    apply_exclude_2023 as apply_exclude_2023_base,
+    build_feature_table as build_feature_table_base,
+)
+from train_per_market_interactions_hour_experts import (
+    build_feature_table as build_feature_table_hour,
+)
 
 
 def _predict_point(model: CatBoostRegressor, X: pd.DataFrame) -> np.ndarray:
@@ -36,6 +43,77 @@ def _sample_df(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
     return df.sample(n=n, random_state=seed).copy()
 
 
+def _call_build_feature_table(
+    build_fn,
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    train_args: dict[str, object],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    sig = inspect.signature(build_fn)
+    allowed = {k: v for k, v in train_args.items() if k in sig.parameters}
+    return build_fn(train_df, test_df, **allowed)
+
+
+def _ensure_required_columns(
+    df: pd.DataFrame,
+    required_cols: list[str],
+    cat_cols: list[str],
+) -> tuple[pd.DataFrame, list[str]]:
+    out = df.copy()
+    missing = [c for c in required_cols if c not in out.columns]
+    if not missing:
+        return out, missing
+
+    cat_set = set(cat_cols)
+    for col in missing:
+        if col in cat_set:
+            out[col] = "__MISSING__"
+        elif col.endswith("_count"):
+            out[col] = 0.0
+        else:
+            out[col] = np.nan
+    return out, missing
+
+
+def _build_features_for_run(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    train_args: dict[str, object],
+    required_cols: list[str],
+) -> tuple[pd.DataFrame, str]:
+    # Newer runs with robust profiles/hour-expert pipeline require the hour-experts builder.
+    needs_hour_builder = (
+        bool(train_args.get("use_robust_target_profiles", False))
+        or any(c.endswith("_count") and c.startswith("target_profile_") for c in required_cols)
+    )
+
+    builders: list[tuple[str, object]] = []
+    if needs_hour_builder:
+        builders.append(("train_per_market_interactions_hour_experts", build_feature_table_hour))
+        builders.append(("train_per_market_interactions", build_feature_table_base))
+    else:
+        builders.append(("train_per_market_interactions", build_feature_table_base))
+        builders.append(("train_per_market_interactions_hour_experts", build_feature_table_hour))
+
+    best_name = ""
+    best_df: pd.DataFrame | None = None
+    best_overlap = -1
+
+    for name, fn in builders:
+        tr_feat, _ = _call_build_feature_table(fn, train_df, test_df, train_args)
+        overlap = len([c for c in required_cols if c in tr_feat.columns])
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_name = name
+            best_df = tr_feat
+        if overlap == len(required_cols):
+            return tr_feat, name
+
+    if best_df is None:
+        raise RuntimeError("Failed to build feature table for SHAP export.")
+    return best_df, best_name
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compute SHAP values from saved per_market_interactions models.")
     parser.add_argument("--runs-root", default="runs")
@@ -61,9 +139,7 @@ def main() -> None:
 
     if bool(train_args.get("exclude_2023", False)):
         keep_month = int(train_args.get("exclude_2023_keep_from_month", 10))
-        train_df = apply_exclude_2023(train_df, keep_from_month=keep_month)
-
-    train_feat, _ = build_feature_table(train_df, test_df)
+        train_df = apply_exclude_2023_base(train_df, keep_from_month=keep_month)
 
     models_dir = run_dir / "models"
     global_model = CatBoostRegressor()
@@ -73,8 +149,25 @@ def main() -> None:
     local_feature_cols: list[str] = meta["feature_cols"]
     cat_cols: list[str] = meta["cat_cols"]
 
+    required_cols = sorted(set(global_feature_cols) | set(local_feature_cols))
+    train_feat, builder_name = _build_features_for_run(train_df, test_df, train_args, required_cols)
+    train_feat, missing_any = _ensure_required_columns(train_feat, required_cols, cat_cols)
+    if missing_any:
+        print(
+            "Warning: SHAP feature reconstruction missing columns; "
+            f"filled defaults for {len(missing_any)} columns."
+        )
+        print(f"Filled: {missing_any}")
+    print(f"SHAP feature builder: {builder_name}")
+
     train_local = train_feat.copy()
     train_local["global_pred_feature"] = _predict_point(global_model, train_feat[global_feature_cols])
+    train_local, missing_local = _ensure_required_columns(train_local, local_feature_cols, cat_cols)
+    if missing_local:
+        print(
+            "Warning: local feature alignment required additional default-filled columns: "
+            f"{missing_local}"
+        )
 
     global_sample = _sample_df(train_feat, args.global_sample_size, args.seed)
     global_pool = Pool(
@@ -122,6 +215,7 @@ def main() -> None:
 
     out_meta = {
         "run_dir": str(run_dir),
+        "feature_builder": builder_name,
         "global_sample_size_used": int(len(global_sample)),
         "per_market_sample_size_requested": int(args.per_market_sample_size),
         "rows_train_after_filter": int(len(train_df)),

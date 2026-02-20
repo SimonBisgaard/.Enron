@@ -828,7 +828,7 @@ def run_time_series_cv(
     tail_gate_threshold: float,
     tail_blend_mode: str,
     tail_delta_clip: float | None,
-) -> tuple[float | None, pd.DataFrame]:
+) -> tuple[float | None, pd.DataFrame, pd.DataFrame]:
     folds = make_time_series_folds(
         train_df=train_df_raw,
         n_folds=n_folds,
@@ -838,10 +838,11 @@ def run_time_series_cv(
     )
     if not folds:
         print("CV skipped: not enough history for requested folds.")
-        return None, pd.DataFrame()
+        return None, pd.DataFrame(), pd.DataFrame()
 
     start_all = _to_datetime_col(train_df_raw, "delivery_start")
     fold_rows: list[dict[str, object]] = []
+    oof_rows: list[pd.DataFrame] = []
     oof = pd.Series(index=train_df_raw.index, dtype=float)
 
     print(
@@ -942,14 +943,22 @@ def run_time_series_cv(
         tmp = pd.DataFrame(
             {
                 "idx": va.index.to_numpy(),
+                "id": va["id"].to_numpy(dtype=int),
+                "delivery_start": va["delivery_start"].to_numpy(),
                 "market": va["market"].to_numpy(),
                 "y_true": va["target"].to_numpy(dtype=float),
                 "y_pred": pred_original,
+                "fold": fold_idx,
             }
         )
         for market, sdf in tmp.groupby("market"):
             m_rmse = _rmse(sdf["y_true"].to_numpy(), sdf["y_pred"].to_numpy())
             print(f"  - {market}: RMSE={m_rmse:.6f} (n={len(sdf)})")
+        oof_rows.append(
+            tmp.rename(columns={"y_true": "target", "y_pred": "pred"})[
+                ["id", "delivery_start", "market", "target", "pred", "fold"]
+            ].copy()
+        )
         oof.loc[va.index] = pred_original
 
     coverage = float(oof.notna().mean())
@@ -960,9 +969,10 @@ def run_time_series_cv(
             train_df_raw.loc[valid, "target"].to_numpy(dtype=float),
             oof.loc[valid].to_numpy(dtype=float),
         )
+    cv_oof = pd.concat(oof_rows, ignore_index=True) if oof_rows else pd.DataFrame()
     print(f"CV OOF coverage: {coverage:.4%}")
     print(f"CV OOF RMSE: {overall if overall is not None else 'None'}")
-    return overall, pd.DataFrame(fold_rows)
+    return overall, pd.DataFrame(fold_rows), cv_oof
 
 
 def train_global_and_local_models(
@@ -1356,8 +1366,9 @@ def main() -> None:
 
     cv_rmse = None
     cv_details = pd.DataFrame()
+    cv_oof = pd.DataFrame()
     if args.cv:
-        cv_rmse, cv_details = run_time_series_cv(
+        cv_rmse, cv_details, cv_oof = run_time_series_cv(
             train_df_raw=train_df,
             n_folds=args.cv_folds,
             val_days=args.cv_val_days,
@@ -1497,6 +1508,10 @@ def main() -> None:
         cv_path = run_dir / "cv_results.csv"
         cv_details.to_csv(cv_path, index=False)
         print(f"Saved CV details: {cv_path}")
+    if not cv_oof.empty:
+        cv_oof_path = run_dir / "cv_oof.csv"
+        cv_oof.to_csv(cv_oof_path, index=False)
+        print(f"Saved CV OOF rows: {cv_oof_path}")
 
     if args.save_models:
         models_dir = run_dir / "models"

@@ -1,0 +1,8 @@
+{
+  "run_dir": "/Users/simonbisgaard/Desktop/nitor/runs/20260220-191036_my_hour_expert_v1",
+  "global_sample_size_used": 1500,
+  "per_market_sample_size_requested": 400,
+  "rows_train_after_filter": 132608,
+  "global_feature_count": 215,
+  "local_feature_count": 215
+}

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from catboost import Pool
+from catboost import CatBoostRegressor, Pool
 
 from train_per_market_interactions import (
     apply_exclude_2023,
@@ -87,6 +87,13 @@ def _cat_indices(feature_cols: list[str], cat_cols: list[str]) -> list[int]:
     return [i for i, c in enumerate(feature_cols) if c in cat_set]
 
 
+def _predict_point(model: CatBoostRegressor, X: pd.DataFrame) -> np.ndarray:
+    pred = np.asarray(model.predict(X))
+    if pred.ndim == 2:
+        return pred[:, 0].astype(float)
+    return pred.astype(float)
+
+
 def _sample_df(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
     if len(df) <= n:
         return df.copy()
@@ -127,10 +134,16 @@ def main() -> None:
         if c in global_feature_cols
     ]
 
-    artifacts = train_global_and_local_models(train_feat, global_feature_cols, cat_cols)
+    artifacts = train_global_and_local_models(
+        train_feat,
+        global_feature_cols,
+        cat_cols,
+        local_residual_modeling=True,
+        include_global_pred_in_local=False,
+    )
 
     train_local = train_feat.copy()
-    train_local["global_pred_feature"] = artifacts.global_model.predict(train_local[global_feature_cols])
+    train_local["global_pred_feature"] = _predict_point(artifacts.global_model, train_local[global_feature_cols])
 
     global_sample = _sample_df(train_feat, args.global_sample_size, args.seed)
     global_pool = Pool(
@@ -140,7 +153,7 @@ def main() -> None:
     global_shap = artifacts.global_model.get_feature_importance(global_pool, type="ShapValues")
     global_shap_values = global_shap[:, :-1]
     global_base_value = global_shap[:, -1]
-    global_preds = artifacts.global_model.predict(global_sample[global_feature_cols])
+    global_preds = _predict_point(artifacts.global_model, global_sample[global_feature_cols])
 
     global_imp = pd.DataFrame(
         {
@@ -151,10 +164,12 @@ def main() -> None:
     global_imp.to_csv(run_dir / "global_feature_importance_shap.csv", index=False)
 
     global_sample_out = global_sample[["id", "market", "delivery_start", "target"]].reset_index(drop=True)
-    global_sample_out["base_value"] = global_base_value
-    global_sample_out["prediction"] = global_preds
-    for i, feat in enumerate(global_feature_cols):
-        global_sample_out[f"shap__{feat}"] = global_shap_values[:, i]
+    global_sample_out = global_sample_out.assign(base_value=global_base_value, prediction=global_preds)
+    shap_cols = pd.DataFrame(
+        global_shap_values,
+        columns=[f"shap__{feat}" for feat in global_feature_cols],
+    )
+    global_sample_out = pd.concat([global_sample_out, shap_cols], axis=1)
     global_sample_out.to_csv(run_dir / "global_shap_sample_rows.csv", index=False)
 
     local_rows: list[dict[str, object]] = []

@@ -17,6 +17,56 @@ from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import PowerTransformer
 
 
+def _write_params_yaml(path: Path, payload: dict[str, Any]) -> None:
+    def _format_scalar(value: Any) -> str:
+        if isinstance(value, (bool, np.bool_)):
+            return "true" if bool(value) else "false"
+        if value is None:
+            return "null"
+        if isinstance(value, (int, np.integer)):
+            return str(int(value))
+        if isinstance(value, (float, np.floating)):
+            v = float(value)
+            if not np.isfinite(v):
+                return json.dumps(str(v))
+            return str(v)
+        return json.dumps(str(value), ensure_ascii=False)
+
+    lines: list[str] = []
+
+    def _emit(key: str, value: Any, indent: int) -> None:
+        pad = "  " * indent
+        if isinstance(value, dict):
+            if not value:
+                lines.append(f"{pad}{key}: {{}}")
+                return
+            lines.append(f"{pad}{key}:")
+            for sub_key, sub_value in value.items():
+                _emit(str(sub_key), sub_value, indent + 1)
+            return
+
+        if isinstance(value, (list, tuple)):
+            if not value:
+                lines.append(f"{pad}{key}: []")
+                return
+            lines.append(f"{pad}{key}:")
+            for item in value:
+                if isinstance(item, dict):
+                    lines.append(f"{pad}  -")
+                    for sub_key, sub_value in item.items():
+                        _emit(str(sub_key), sub_value, indent + 2)
+                else:
+                    lines.append(f"{pad}  - {_format_scalar(item)}")
+            return
+
+        lines.append(f"{pad}{key}: {_format_scalar(value)}")
+
+    for k, v in payload.items():
+        _emit(str(k), v, 0)
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _to_datetime_col(df: pd.DataFrame, col: str) -> pd.Series:
     out = pd.to_datetime(df[col], errors="coerce")
     if out.isna().any():
@@ -405,19 +455,21 @@ def _add_dynamic_profile_for_keys(
     test_df: pd.DataFrame,
     keys: list[str],
     prefix: str,
+    *,
+    target_col: str = "target",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     train_out = train_df.copy()
     test_out = test_df.copy()
 
     # Train features are strictly past-only per group (no future leakage).
-    work = train_out[keys + ["delivery_start", "target"]].copy()
+    work = train_out[keys + ["delivery_start", target_col]].copy()
     work["_orig_idx"] = work.index
     work = work.sort_values(keys + ["delivery_start", "_orig_idx"]).reset_index(drop=True)
     grp = work.groupby(keys, dropna=False, sort=False)
 
     work[f"{prefix}_dyn_count"] = grp.cumcount().astype(float)
-    work["_target_sq"] = work["target"] ** 2
-    work["_sum_prev"] = grp["target"].cumsum() - work["target"]
+    work["_target_sq"] = work[target_col] ** 2
+    work["_sum_prev"] = grp[target_col].cumsum() - work[target_col]
     work["_sum_sq_prev"] = grp["_target_sq"].cumsum() - work["_target_sq"]
     denom = work[f"{prefix}_dyn_count"].replace(0.0, np.nan)
 
@@ -437,15 +489,15 @@ def _add_dynamic_profile_for_keys(
     train_out = train_out.join(work.set_index("_orig_idx")[dyn_cols], how="left")
 
     # Test rows get latest profile from full train history.
-    agg_in = train_out[keys + ["target"]].copy()
-    agg_in["_target_sq"] = agg_in["target"] ** 2
+    agg_in = train_out[keys + [target_col]].copy()
+    agg_in["_target_sq"] = agg_in[target_col] ** 2
     agg = (
         agg_in.groupby(keys, dropna=False)
         .agg(
             **{
-                f"{prefix}_dyn_count": ("target", "count"),
-                f"{prefix}_dyn_mean": ("target", "mean"),
-                f"{prefix}_dyn_std": ("target", "std"),
+                f"{prefix}_dyn_count": (target_col, "count"),
+                f"{prefix}_dyn_mean": (target_col, "mean"),
+                f"{prefix}_dyn_std": (target_col, "std"),
                 f"{prefix}_dyn_sq_mean": ("_target_sq", "mean"),
             }
         )
@@ -457,7 +509,14 @@ def _add_dynamic_profile_for_keys(
     return train_out, test_out
 
 
-def add_dynamic_market_profile_features(train_df: pd.DataFrame, test_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def add_dynamic_market_profile_features(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    *,
+    target_col: str = "target",
+    shrink_alpha_mhd: float = 24.0,
+    shrink_alpha_m: float = 24.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     train_out = train_df.copy()
     test_out = test_df.copy()
 
@@ -467,7 +526,13 @@ def add_dynamic_market_profile_features(train_df: pd.DataFrame, test_df: pd.Data
         (["market"], "target_profile_m"),
     ]
     for keys, prefix in scopes:
-        train_out, test_out = _add_dynamic_profile_for_keys(train_out, test_out, keys, prefix)
+        train_out, test_out = _add_dynamic_profile_for_keys(
+            train_out,
+            test_out,
+            keys,
+            prefix,
+            target_col=target_col,
+        )
 
     # Fall back to static profile values when dynamic history is missing.
     for prefix in ["target_profile_mhd", "target_profile_mh", "target_profile_m"]:
@@ -493,8 +558,8 @@ def add_dynamic_market_profile_features(train_df: pd.DataFrame, test_df: pd.Data
         train_out[count_col] = train_out[count_col].fillna(0.0)
         test_out[count_col] = test_out[count_col].fillna(0.0)
 
-    global_mean = float(train_out["target"].mean())
-    global_std = float(train_out["target"].std())
+    global_mean = float(train_out[target_col].mean())
+    global_std = float(train_out[target_col].std())
 
     # Cross-scope backoff for unseen combinations in test.
     for df in [train_out, test_out]:
@@ -533,13 +598,42 @@ def add_dynamic_market_profile_features(train_df: pd.DataFrame, test_df: pd.Data
             .fillna(df["target_profile_m_dyn_std"])
         )
 
+        # Count-aware shrinkage to market-hour level prevents tiny-group spikes.
+        c_mhd = pd.to_numeric(df["target_profile_mhd_dyn_count"], errors="coerce").fillna(0.0)
+        c_mh = pd.to_numeric(df["target_profile_mh_dyn_count"], errors="coerce").fillna(0.0)
+        a_mhd = float(max(shrink_alpha_mhd, 1e-6))
+        a_m = float(max(shrink_alpha_m, 1e-6))
+        w_mhd = c_mhd / (c_mhd + a_mhd)
+        w_mh = c_mh / (c_mh + a_m)
+
+        df["target_profile_mhd_dyn_mean"] = (
+            w_mhd * df["target_profile_mhd_dyn_mean"]
+            + (1.0 - w_mhd) * df["target_profile_mh_dyn_mean"]
+        )
+        df["target_profile_mhd_dyn_std"] = np.maximum(
+            0.0,
+            w_mhd * df["target_profile_mhd_dyn_std"]
+            + (1.0 - w_mhd) * df["target_profile_mh_dyn_std"],
+        )
+
+        df["target_profile_m_dyn_mean"] = (
+            (1.0 - w_mh) * df["target_profile_m_dyn_mean"]
+            + w_mh * df["target_profile_mh_dyn_mean"]
+        )
+        df["target_profile_m_dyn_std"] = np.maximum(
+            0.0,
+            (1.0 - w_mh) * df["target_profile_m_dyn_std"]
+            + w_mh * df["target_profile_mh_dyn_std"],
+        )
+
         for prefix in ["target_profile_m", "target_profile_mh", "target_profile_mhd"]:
             mean_col = f"{prefix}_dyn_mean"
             sq_col = f"{prefix}_dyn_sq_mean"
+            std_col = f"{prefix}_dyn_std"
             rms_col = f"{prefix}_dyn_rms"
             count_col = f"{prefix}_dyn_count"
-            df[sq_col] = df[sq_col].fillna(df[mean_col] ** 2)
-            df[rms_col] = df[rms_col].fillna(np.sqrt(np.maximum(df[sq_col], 0.0)))
+            df[sq_col] = np.maximum(df[mean_col] ** 2 + np.maximum(df[std_col], 0.0) ** 2, 0.0)
+            df[rms_col] = np.sqrt(np.maximum(df[sq_col], 0.0))
             df[count_col] = df[count_col].fillna(0.0)
     return train_out, test_out
 
@@ -549,6 +643,12 @@ def add_market_profile_features(
     test_df: pd.DataFrame,
     *,
     use_dynamic_profiles: bool,
+    use_robust_profiles: bool = True,
+    robust_winsor_lower_q: float = 0.01,
+    robust_winsor_upper_q: float = 0.99,
+    robust_winsor_min_rows: int = 24,
+    profile_shrink_alpha_mhd: float = 24.0,
+    profile_shrink_alpha_m: float = 24.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Tailored features per market from train target profile.
@@ -556,23 +656,81 @@ def add_market_profile_features(
     train_out = train_df.copy()
     test_out = test_df.copy()
 
+    if not (0.0 < robust_winsor_lower_q < robust_winsor_upper_q < 1.0):
+        raise ValueError("Robust profile quantiles must satisfy 0 < lower < upper < 1.")
+    if robust_winsor_min_rows < 1:
+        raise ValueError("robust_winsor_min_rows must be >= 1.")
+
+    profile_target_col = "target"
+    if use_robust_profiles:
+        base = train_out[["market", "hour", "target"]].copy()
+        g_mh = base.groupby(["market", "hour"], dropna=False)["target"]
+        by_mh_q = pd.concat(
+            [
+                g_mh.quantile(robust_winsor_lower_q).rename("_q_lo_mh"),
+                g_mh.quantile(robust_winsor_upper_q).rename("_q_hi_mh"),
+                g_mh.size().rename("_n_mh"),
+            ],
+            axis=1,
+        ).reset_index()
+
+        g_m = base.groupby("market", dropna=False)["target"]
+        by_m_q = pd.concat(
+            [
+                g_m.quantile(robust_winsor_lower_q).rename("_q_lo_m"),
+                g_m.quantile(robust_winsor_upper_q).rename("_q_hi_m"),
+            ],
+            axis=1,
+        ).reset_index()
+
+        q_lo_g = float(base["target"].quantile(robust_winsor_lower_q))
+        q_hi_g = float(base["target"].quantile(robust_winsor_upper_q))
+        tmp = base.merge(by_mh_q, on=["market", "hour"], how="left").merge(by_m_q, on=["market"], how="left")
+        use_mh = pd.to_numeric(tmp["_n_mh"], errors="coerce").fillna(0.0) >= float(robust_winsor_min_rows)
+        lo = np.where(use_mh, tmp["_q_lo_mh"], tmp["_q_lo_m"])
+        hi = np.where(use_mh, tmp["_q_hi_mh"], tmp["_q_hi_m"])
+        lo = pd.Series(lo, index=tmp.index).fillna(q_lo_g).to_numpy(dtype=float)
+        hi = pd.Series(hi, index=tmp.index).fillna(q_hi_g).to_numpy(dtype=float)
+        hi = np.maximum(hi, lo)
+
+        train_out["_target_profile_robust"] = np.clip(train_out["target"].to_numpy(dtype=float), lo, hi)
+        profile_target_col = "_target_profile_robust"
+
     by_mhd = (
-        train_out.groupby(["market", "hour", "dow"], dropna=False)["target"]
-        .agg(["mean", "std"])
+        train_out.groupby(["market", "hour", "dow"], dropna=False)[profile_target_col]
+        .agg(["mean", "std", "count"])
         .reset_index()
-        .rename(columns={"mean": "target_profile_mhd_mean", "std": "target_profile_mhd_std"})
+        .rename(
+            columns={
+                "mean": "target_profile_mhd_mean",
+                "std": "target_profile_mhd_std",
+                "count": "target_profile_mhd_count",
+            }
+        )
     )
     by_mh = (
-        train_out.groupby(["market", "hour"], dropna=False)["target"]
-        .agg(["mean", "std"])
+        train_out.groupby(["market", "hour"], dropna=False)[profile_target_col]
+        .agg(["mean", "std", "count"])
         .reset_index()
-        .rename(columns={"mean": "target_profile_mh_mean", "std": "target_profile_mh_std"})
+        .rename(
+            columns={
+                "mean": "target_profile_mh_mean",
+                "std": "target_profile_mh_std",
+                "count": "target_profile_mh_count",
+            }
+        )
     )
     by_m = (
-        train_out.groupby("market", dropna=False)["target"]
-        .agg(["mean", "std"])
+        train_out.groupby("market", dropna=False)[profile_target_col]
+        .agg(["mean", "std", "count"])
         .reset_index()
-        .rename(columns={"mean": "target_profile_m_mean", "std": "target_profile_m_std"})
+        .rename(
+            columns={
+                "mean": "target_profile_m_mean",
+                "std": "target_profile_m_std",
+                "count": "target_profile_m_count",
+            }
+        )
     )
 
     train_out = train_out.merge(by_mhd, on=["market", "hour", "dow"], how="left")
@@ -581,8 +739,63 @@ def add_market_profile_features(
     test_out = test_out.merge(by_mh, on=["market", "hour"], how="left")
     train_out = train_out.merge(by_m, on=["market"], how="left")
     test_out = test_out.merge(by_m, on=["market"], how="left")
+
+    global_mean = float(train_out[profile_target_col].mean())
+    global_std = float(train_out[profile_target_col].std())
+    if not np.isfinite(global_std):
+        global_std = 0.0
+
+    for df in [train_out, test_out]:
+        df["target_profile_m_mean"] = df["target_profile_m_mean"].fillna(global_mean)
+        df["target_profile_m_std"] = df["target_profile_m_std"].fillna(global_std)
+
+        df["target_profile_mh_mean"] = df["target_profile_mh_mean"].fillna(df["target_profile_m_mean"])
+        df["target_profile_mh_std"] = df["target_profile_mh_std"].fillna(df["target_profile_m_std"])
+
+        df["target_profile_mhd_mean"] = df["target_profile_mhd_mean"].fillna(df["target_profile_mh_mean"])
+        df["target_profile_mhd_std"] = df["target_profile_mhd_std"].fillna(df["target_profile_mh_std"])
+
+        for c in ["target_profile_m_count", "target_profile_mh_count", "target_profile_mhd_count"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+        # Count-aware shrinkage toward market-hour baselines.
+        a_mhd = float(max(profile_shrink_alpha_mhd, 1e-6))
+        a_m = float(max(profile_shrink_alpha_m, 1e-6))
+
+        w_mhd = df["target_profile_mhd_count"] / (df["target_profile_mhd_count"] + a_mhd)
+        w_mh = df["target_profile_mh_count"] / (df["target_profile_mh_count"] + a_m)
+
+        df["target_profile_mhd_mean"] = (
+            w_mhd * df["target_profile_mhd_mean"]
+            + (1.0 - w_mhd) * df["target_profile_mh_mean"]
+        )
+        df["target_profile_mhd_std"] = np.maximum(
+            0.0,
+            w_mhd * df["target_profile_mhd_std"]
+            + (1.0 - w_mhd) * df["target_profile_mh_std"],
+        )
+
+        df["target_profile_m_mean"] = (
+            (1.0 - w_mh) * df["target_profile_m_mean"]
+            + w_mh * df["target_profile_mh_mean"]
+        )
+        df["target_profile_m_std"] = np.maximum(
+            0.0,
+            (1.0 - w_mh) * df["target_profile_m_std"]
+            + w_mh * df["target_profile_mh_std"],
+        )
+
     if use_dynamic_profiles:
-        train_out, test_out = add_dynamic_market_profile_features(train_out, test_out)
+        train_out, test_out = add_dynamic_market_profile_features(
+            train_out,
+            test_out,
+            target_col=profile_target_col,
+            shrink_alpha_mhd=profile_shrink_alpha_mhd,
+            shrink_alpha_m=profile_shrink_alpha_m,
+        )
+
+    train_out = train_out.drop(columns=["_target_profile_robust"], errors="ignore")
+    test_out = test_out.drop(columns=["_target_profile_robust"], errors="ignore")
     return train_out, test_out
 
 
@@ -599,6 +812,107 @@ def apply_exclude_2023(df: pd.DataFrame, keep_from_month: int = 10) -> pd.DataFr
         f"removed={removed}, kept_from_2023_month_{keep_from_month}={kept_2023}"
     )
     return out.loc[keep_mask].copy()
+
+
+@dataclass
+class PredictionCapper:
+    by_market_hour: pd.DataFrame
+    by_market: pd.DataFrame
+    global_lower: float
+    global_upper: float
+    softness: float
+
+
+def _ensure_hour_column(df: pd.DataFrame) -> pd.DataFrame:
+    if "hour" in df.columns:
+        out = df.copy()
+        out["hour"] = pd.to_numeric(out["hour"], errors="coerce").fillna(-1).astype(int)
+        return out
+    if "delivery_start" not in df.columns:
+        raise ValueError("Need either 'hour' or 'delivery_start' to build market-hour caps.")
+    out = df.copy()
+    out["hour"] = _to_datetime_col(out, "delivery_start").dt.hour.astype(int)
+    return out
+
+
+def fit_market_hour_prediction_capper(
+    train_df: pd.DataFrame,
+    *,
+    lower_q: float,
+    upper_q: float,
+    min_rows: int,
+    softness: float,
+) -> PredictionCapper:
+    if not (0.0 <= lower_q < upper_q <= 1.0):
+        raise ValueError("Prediction cap quantiles must satisfy 0 <= lower < upper <= 1.")
+    if min_rows < 1:
+        raise ValueError("Prediction cap min_rows must be >= 1.")
+    if not (0.0 <= softness <= 1.0):
+        raise ValueError("Prediction cap softness must be in [0,1].")
+
+    base = _ensure_hour_column(train_df)[["market", "hour", "target"]].copy()
+
+    g_mh = base.groupby(["market", "hour"], dropna=False)["target"]
+    by_mh = pd.concat(
+        [
+            g_mh.quantile(lower_q).rename("lower"),
+            g_mh.quantile(upper_q).rename("upper"),
+            g_mh.size().rename("n"),
+        ],
+        axis=1,
+    ).reset_index()
+    by_mh = by_mh.loc[by_mh["n"] >= int(min_rows)].copy()
+
+    g_m = base.groupby("market", dropna=False)["target"]
+    by_m = pd.concat(
+        [
+            g_m.quantile(lower_q).rename("lower"),
+            g_m.quantile(upper_q).rename("upper"),
+        ],
+        axis=1,
+    ).reset_index()
+
+    global_lower = float(base["target"].quantile(lower_q))
+    global_upper = float(base["target"].quantile(upper_q))
+    if global_upper < global_lower:
+        global_upper = global_lower
+
+    return PredictionCapper(
+        by_market_hour=by_mh,
+        by_market=by_m,
+        global_lower=global_lower,
+        global_upper=global_upper,
+        softness=float(softness),
+    )
+
+
+def apply_market_hour_prediction_caps(
+    pred: np.ndarray,
+    rows: pd.DataFrame,
+    capper: PredictionCapper,
+) -> tuple[np.ndarray, int]:
+    if len(pred) == 0:
+        return pred.astype(float, copy=True), 0
+
+    row_df = _ensure_hour_column(rows)[["market", "hour"]].copy()
+    row_df["_row"] = np.arange(len(row_df), dtype=int)
+
+    tmp = row_df.merge(capper.by_market_hour, on=["market", "hour"], how="left")
+    by_m = capper.by_market.rename(columns={"lower": "lower_m", "upper": "upper_m"})
+    tmp = tmp.merge(by_m, on=["market"], how="left")
+
+    lower = tmp["lower"].fillna(tmp["lower_m"]).fillna(capper.global_lower).to_numpy(dtype=float)
+    upper = tmp["upper"].fillna(tmp["upper_m"]).fillna(capper.global_upper).to_numpy(dtype=float)
+    upper = np.maximum(upper, lower)
+
+    out = pred.astype(float, copy=True)
+    softness = float(capper.softness)
+    high = out > upper
+    low = out < lower
+    out[high] = upper[high] + softness * (out[high] - upper[high])
+    out[low] = lower[low] + softness * (out[low] - lower[low])
+    changed = int(np.count_nonzero(np.abs(out - pred) > 1e-12))
+    return out, changed
 
 
 @dataclass
@@ -848,6 +1162,12 @@ def run_time_series_cv(
     step_days: int,
     min_train_days: int,
     use_dynamic_target_profiles: bool,
+    use_robust_target_profiles: bool,
+    profile_winsor_lower_q: float,
+    profile_winsor_upper_q: float,
+    profile_winsor_min_rows: int,
+    profile_shrink_alpha_mhd: float,
+    profile_shrink_alpha_m: float,
     use_temporal_regime: bool,
     use_volatility_regime: bool,
     use_wind_proxy: bool,
@@ -872,6 +1192,11 @@ def run_time_series_cv(
     hour_expert_mode: str,
     hour_expert_min_rows: int,
     hour_expert_weight: float,
+    use_market_hour_pred_caps: bool,
+    pred_cap_lower_q: float,
+    pred_cap_upper_q: float,
+    pred_cap_min_rows: int,
+    pred_cap_softness: float,
 ) -> tuple[float | None, pd.DataFrame, pd.DataFrame]:
     folds = make_time_series_folds(
         train_df=train_df_raw,
@@ -912,6 +1237,12 @@ def run_time_series_cv(
             tr,
             va.drop(columns=["target"]).copy(),
             use_dynamic_target_profiles=use_dynamic_target_profiles,
+            use_robust_target_profiles=use_robust_target_profiles,
+            profile_winsor_lower_q=profile_winsor_lower_q,
+            profile_winsor_upper_q=profile_winsor_upper_q,
+            profile_winsor_min_rows=profile_winsor_min_rows,
+            profile_shrink_alpha_mhd=profile_shrink_alpha_mhd,
+            profile_shrink_alpha_m=profile_shrink_alpha_m,
             use_temporal_regime=use_temporal_regime,
             use_volatility_regime=use_volatility_regime,
             use_wind_proxy=use_wind_proxy,
@@ -974,6 +1305,23 @@ def run_time_series_cv(
             raise ValueError(f"NaNs in CV predictions for fold {fold_idx}")
 
         pred_original = _apply_target_inverse(pred, artifacts.target_transform_state)
+        if use_market_hour_pred_caps:
+            capper = fit_market_hour_prediction_capper(
+                tr_feat,
+                lower_q=pred_cap_lower_q,
+                upper_q=pred_cap_upper_q,
+                min_rows=pred_cap_min_rows,
+                softness=pred_cap_softness,
+            )
+            pred_original, n_capped = apply_market_hour_prediction_caps(
+                pred_original,
+                va_feat[["market", "hour"]],
+                capper,
+            )
+            print(
+                f"  - fold {fold_idx} market-hour caps: adjusted_rows={n_capped} "
+                f"({(100.0 * n_capped / max(len(pred_original), 1)):.2f}%)"
+            )
 
         fold_rmse = _rmse(va["target"].to_numpy(dtype=float), pred_original)
         print(f"CV fold {fold_idx} RMSE={fold_rmse:.6f}")
@@ -1276,6 +1624,12 @@ def build_feature_table(
     test_df: pd.DataFrame,
     *,
     use_dynamic_target_profiles: bool = True,
+    use_robust_target_profiles: bool = True,
+    profile_winsor_lower_q: float = 0.01,
+    profile_winsor_upper_q: float = 0.99,
+    profile_winsor_min_rows: int = 24,
+    profile_shrink_alpha_mhd: float = 24.0,
+    profile_shrink_alpha_m: float = 24.0,
     use_temporal_regime: bool = False,
     use_volatility_regime: bool = False,
     use_wind_proxy: bool = False,
@@ -1306,6 +1660,12 @@ def build_feature_table(
         train_out,
         test_out,
         use_dynamic_profiles=use_dynamic_target_profiles,
+        use_robust_profiles=use_robust_target_profiles,
+        robust_winsor_lower_q=profile_winsor_lower_q,
+        robust_winsor_upper_q=profile_winsor_upper_q,
+        robust_winsor_min_rows=profile_winsor_min_rows,
+        profile_shrink_alpha_mhd=profile_shrink_alpha_mhd,
+        profile_shrink_alpha_m=profile_shrink_alpha_m,
     )
     return train_out, test_out
 
@@ -1331,6 +1691,42 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable lag-safe dynamic target profiles including dynamic squared-mean and RMS features (default: enabled).",
+    )
+    parser.add_argument(
+        "--use-robust-target-profiles",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use winsorized targets + market-hour shrinkage in target_profile_* features (default: enabled).",
+    )
+    parser.add_argument(
+        "--profile-winsor-lower-q",
+        type=float,
+        default=0.01,
+        help="Lower quantile for robust target-profile winsorization (default: 0.01).",
+    )
+    parser.add_argument(
+        "--profile-winsor-upper-q",
+        type=float,
+        default=0.99,
+        help="Upper quantile for robust target-profile winsorization (default: 0.99).",
+    )
+    parser.add_argument(
+        "--profile-winsor-min-rows",
+        type=int,
+        default=24,
+        help="Minimum market-hour rows before using market-hour winsor bounds (default: 24).",
+    )
+    parser.add_argument(
+        "--profile-shrink-alpha-mhd",
+        type=float,
+        default=24.0,
+        help="Shrinkage alpha for market-hour-dow profiles toward market-hour baseline (default: 24).",
+    )
+    parser.add_argument(
+        "--profile-shrink-alpha-m",
+        type=float,
+        default=24.0,
+        help="Shrinkage alpha for market profile toward market-hour baseline (default: 24).",
     )
     parser.add_argument(
         "--use-temporal-regime",
@@ -1477,6 +1873,36 @@ def main() -> None:
         help="Global scaling applied to hour-expert correction (default: 0.6).",
     )
     parser.add_argument(
+        "--use-market-hour-pred-caps",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply market-hour soft prediction caps from train quantiles (default: enabled).",
+    )
+    parser.add_argument(
+        "--pred-cap-lower-q",
+        type=float,
+        default=0.01,
+        help="Lower quantile for market-hour prediction cap fitting (default: 0.01).",
+    )
+    parser.add_argument(
+        "--pred-cap-upper-q",
+        type=float,
+        default=0.99,
+        help="Upper quantile for market-hour prediction cap fitting (default: 0.99).",
+    )
+    parser.add_argument(
+        "--pred-cap-min-rows",
+        type=int,
+        default=24,
+        help="Minimum rows for market-hour cap; otherwise fallback to market/global caps (default: 24).",
+    )
+    parser.add_argument(
+        "--pred-cap-softness",
+        type=float,
+        default=0.10,
+        help="Soft-cap slope in [0,1]; 0 is hard clip, 1 keeps extremes unchanged (default: 0.10).",
+    )
+    parser.add_argument(
         "--save-models",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1521,6 +1947,12 @@ def main() -> None:
             step_days=args.cv_step_days,
             min_train_days=args.cv_min_train_days,
             use_dynamic_target_profiles=args.use_dynamic_target_profiles,
+            use_robust_target_profiles=args.use_robust_target_profiles,
+            profile_winsor_lower_q=args.profile_winsor_lower_q,
+            profile_winsor_upper_q=args.profile_winsor_upper_q,
+            profile_winsor_min_rows=args.profile_winsor_min_rows,
+            profile_shrink_alpha_mhd=args.profile_shrink_alpha_mhd,
+            profile_shrink_alpha_m=args.profile_shrink_alpha_m,
             use_temporal_regime=args.use_temporal_regime,
             use_volatility_regime=args.use_volatility_regime,
             use_wind_proxy=args.use_wind_proxy,
@@ -1545,12 +1977,23 @@ def main() -> None:
             hour_expert_mode=args.hour_expert_mode,
             hour_expert_min_rows=args.hour_expert_min_rows,
             hour_expert_weight=args.hour_expert_weight,
+            use_market_hour_pred_caps=args.use_market_hour_pred_caps,
+            pred_cap_lower_q=args.pred_cap_lower_q,
+            pred_cap_upper_q=args.pred_cap_upper_q,
+            pred_cap_min_rows=args.pred_cap_min_rows,
+            pred_cap_softness=args.pred_cap_softness,
         )
 
     train_feat, test_feat = build_feature_table(
         train_df,
         test_df,
         use_dynamic_target_profiles=args.use_dynamic_target_profiles,
+        use_robust_target_profiles=args.use_robust_target_profiles,
+        profile_winsor_lower_q=args.profile_winsor_lower_q,
+        profile_winsor_upper_q=args.profile_winsor_upper_q,
+        profile_winsor_min_rows=args.profile_winsor_min_rows,
+        profile_shrink_alpha_mhd=args.profile_shrink_alpha_mhd,
+        profile_shrink_alpha_m=args.profile_shrink_alpha_m,
         use_temporal_regime=args.use_temporal_regime,
         use_volatility_regime=args.use_volatility_regime,
         use_wind_proxy=args.use_wind_proxy,
@@ -1617,6 +2060,25 @@ def main() -> None:
         raise ValueError("NaNs found in predictions.")
 
     pred = _apply_target_inverse(pred, artifacts.target_transform_state)
+    if args.use_market_hour_pred_caps:
+        capper = fit_market_hour_prediction_capper(
+            train_feat,
+            lower_q=args.pred_cap_lower_q,
+            upper_q=args.pred_cap_upper_q,
+            min_rows=args.pred_cap_min_rows,
+            softness=args.pred_cap_softness,
+        )
+        pred, n_capped = apply_market_hour_prediction_caps(
+            pred,
+            test_feat[["market", "hour"]],
+            capper,
+        )
+        print(
+            "Applied market-hour prediction caps: "
+            f"adjusted_rows={n_capped} ({(100.0 * n_capped / max(len(pred), 1)):.2f}%), "
+            f"q=({args.pred_cap_lower_q:.3f},{args.pred_cap_upper_q:.3f}), "
+            f"min_rows={args.pred_cap_min_rows}, softness={args.pred_cap_softness:.3f}"
+        )
 
     out_sub = sample[["id"]].copy()
     pred_map = pd.Series(pred, index=test_feat["id"].astype(int))
@@ -1627,6 +2089,20 @@ def main() -> None:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = Path(args.out_dir) / f"{stamp}_{args.name}"
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    params_path = run_dir / "params.yaml"
+    _write_params_yaml(
+        params_path,
+        {
+            "run_id": run_dir.name,
+            "name": args.name,
+            "generated_at": datetime.now().isoformat(),
+            "cv_rmse": None if cv_rmse is None else float(cv_rmse),
+            "target_transform": artifacts.target_transform_state.to_metadata(),
+            "args": vars(args),
+        },
+    )
+
     sub_path = run_dir / "submission.csv"
     out_sub.to_csv(sub_path, index=False)
 
@@ -1635,6 +2111,7 @@ def main() -> None:
 
     print(f"Saved submission: {sub_path}")
     print(f"Saved latest copy: {latest_path}")
+    print(f"Saved params: {params_path}")
     print(f"Features used: {len(artifacts.feature_cols)}")
     print(f"Categorical features: {artifacts.cat_cols}")
     print(f"Markets modeled: {sorted(artifacts.local_models.keys())}")
@@ -1665,6 +2142,16 @@ def main() -> None:
             f"weight={artifacts.hour_expert_weight}"
         )
         print(f"Hour expert markets trained: {len(artifacts.local_hour_models)}")
+    print(f"Robust target profiles enabled: {args.use_robust_target_profiles}")
+    if args.use_robust_target_profiles:
+        print(
+            "Robust target profile settings: "
+            f"winsor_q=({args.profile_winsor_lower_q},{args.profile_winsor_upper_q}), "
+            f"winsor_min_rows={args.profile_winsor_min_rows}, "
+            f"alpha_mhd={args.profile_shrink_alpha_mhd}, "
+            f"alpha_m={args.profile_shrink_alpha_m}"
+        )
+    print(f"Market-hour prediction caps enabled: {args.use_market_hour_pred_caps}")
     print(f"Target transform: {artifacts.target_transform_state.to_metadata()}")
     print(f"CV RMSE: {cv_rmse}")
     if not cv_details.empty:

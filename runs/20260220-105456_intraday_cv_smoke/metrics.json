@@ -1,0 +1,11 @@
+{
+  "cv_folds": [],
+  "cv_oof_coverage": 0.0,
+  "cv_per_market_rmse": {},
+  "cv_rmse": null,
+  "cv_rmse_18_19": null,
+  "p_spike_mean_test": 0.017219057969371017,
+  "run_id": "20260220-105456_intraday_cv_smoke",
+  "test_missing_meteo_rate": 0.04535043518094366,
+  "train_rmse_in_sample": 24.449630461740792
+}

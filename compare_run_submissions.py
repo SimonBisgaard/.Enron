@@ -145,6 +145,11 @@ def main() -> None:
     parser.add_argument("--runs-dir", default="runs")
     parser.add_argument("--newest-run-id", default=None)
     parser.add_argument("--best-run-id", default=None)
+    parser.add_argument(
+        "--best-submission-path",
+        default="submissio.csv",
+        help="Champion submission file to compare against (default: submissio.csv).",
+    )
     parser.add_argument("--public-rmse", type=float, default=None, help="If omitted, uses newest lb_score or fallback 25.0")
     parser.add_argument("--public-fraction", type=float, default=0.4)
     parser.add_argument("--test-size", type=int, default=13098)
@@ -164,10 +169,27 @@ def main() -> None:
 
     if newest.submission is None:
         raise ValueError(f"Newest run has no valid submission.csv: {newest.run_id}")
-    if best.submission is None:
-        raise ValueError(f"Best-CV run has no valid submission.csv: {best.run_id}")
+    best_submission_ref = Path(args.best_submission_path)
+    best_submission_df: pd.DataFrame | None = None
+    best_submission_label: str = best.run_id
 
-    compare = _compare_predictions(best.submission, newest.submission)
+    if best_submission_ref.exists():
+        champ = pd.read_csv(best_submission_ref)
+        if {"id", "target"}.issubset(champ.columns):
+            champ = champ[["id", "target"]].copy()
+            champ["id"] = pd.to_numeric(champ["id"], errors="coerce")
+            champ["target"] = pd.to_numeric(champ["target"], errors="coerce")
+            champ = champ.dropna().sort_values("id").reset_index(drop=True)
+            if not champ.empty:
+                best_submission_df = champ
+                best_submission_label = f"file:{best_submission_ref}"
+
+    if best_submission_df is None:
+        if best.submission is None:
+            raise ValueError(f"Best-CV run has no valid submission.csv: {best.run_id}")
+        best_submission_df = best.submission
+
+    compare = _compare_predictions(best_submission_df, newest.submission)
 
     cv_delta = None
     if newest.cv_rmse is not None and best.cv_rmse is not None:
@@ -190,6 +212,7 @@ def main() -> None:
             "cv_rmse": best.cv_rmse,
             "lb_score": best.lb_score,
         },
+        "best_submission_reference": best_submission_label,
         "cv_rmse_delta_new_minus_best": cv_delta,
         "submission_comparison": compare,
         "public_score_variance_estimate": variance,
@@ -209,6 +232,7 @@ def main() -> None:
 
     print(f"Newest run: {newest.run_id} | cv_rmse={newest.cv_rmse} | lb={newest.lb_score}")
     print(f"Best CV run: {best.run_id} | cv_rmse={best.cv_rmse} | lb={best.lb_score}")
+    print(f"Best submission reference: {best_submission_label}")
     print(f"CV delta (new-best): {cv_delta}")
     print("--- Submission comparison ---")
     for k, v in compare.items():

@@ -1,0 +1,44 @@
+{
+  "fallback_regressor": {
+    "bagging_temperature": 0.5,
+    "depth": 8,
+    "eval_metric": "RMSE",
+    "iterations": 3200,
+    "l2_leaf_reg": 24,
+    "learning_rate": 0.02,
+    "loss_function": "RMSE",
+    "random_strength": 0.9,
+    "verbose": 0
+  },
+  "full_regressor": {
+    "bagging_temperature": 0.5,
+    "depth": 8,
+    "eval_metric": "RMSE",
+    "iterations": 3200,
+    "l2_leaf_reg": 24,
+    "learning_rate": 0.02,
+    "loss_function": "RMSE",
+    "random_strength": 0.9,
+    "verbose": 0
+  },
+  "spike_classifier": {
+    "depth": 7,
+    "eval_metric": "AUC",
+    "iterations": 1200,
+    "l2_leaf_reg": 18,
+    "learning_rate": 0.03,
+    "loss_function": "Logloss",
+    "verbose": 0
+  },
+  "uplift_regressor": {
+    "bagging_temperature": 0.8,
+    "depth": 8,
+    "eval_metric": "RMSE",
+    "iterations": 2200,
+    "l2_leaf_reg": 28,
+    "learning_rate": 0.02,
+    "loss_function": "RMSE",
+    "random_strength": 1.0,
+    "verbose": 0
+  }
+}

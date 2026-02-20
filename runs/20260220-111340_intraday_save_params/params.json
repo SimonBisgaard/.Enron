@@ -1,0 +1,62 @@
+{
+  "config_name": "intraday_save_params",
+  "cv_folds": 5,
+  "cv_min_train_days": 120,
+  "cv_step_days": 14,
+  "cv_val_days": 14,
+  "exclude_2023": false,
+  "exclude_2023_keep_from_month": 10,
+  "model_params": {
+    "fallback_regressor": {
+      "bagging_temperature": 0.5,
+      "depth": 8,
+      "eval_metric": "RMSE",
+      "iterations": 3200,
+      "l2_leaf_reg": 24,
+      "learning_rate": 0.02,
+      "loss_function": "RMSE",
+      "random_strength": 0.9,
+      "verbose": 0
+    },
+    "full_regressor": {
+      "bagging_temperature": 0.5,
+      "depth": 8,
+      "eval_metric": "RMSE",
+      "iterations": 3200,
+      "l2_leaf_reg": 24,
+      "learning_rate": 0.02,
+      "loss_function": "RMSE",
+      "random_strength": 0.9,
+      "verbose": 0
+    },
+    "spike_classifier": {
+      "depth": 7,
+      "eval_metric": "AUC",
+      "iterations": 1200,
+      "l2_leaf_reg": 18,
+      "learning_rate": 0.03,
+      "loss_function": "Logloss",
+      "verbose": 0
+    },
+    "uplift_regressor": {
+      "bagging_temperature": 0.8,
+      "depth": 8,
+      "eval_metric": "RMSE",
+      "iterations": 2200,
+      "l2_leaf_reg": 28,
+      "learning_rate": 0.02,
+      "loss_function": "RMSE",
+      "random_strength": 1.0,
+      "verbose": 0
+    }
+  },
+  "num_all_features": 130,
+  "num_fallback_features": 107,
+  "num_test_rows": 13098,
+  "num_train_rows": 132608,
+  "params_in": null,
+  "params_out": "intraday_params_v1.json",
+  "run_id": "20260220-111340_intraday_save_params",
+  "seed": 42,
+  "started_at": "2026-02-20T11:13:40.331958+00:00"
+}

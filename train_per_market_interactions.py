@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor
+from sklearn.metrics import mean_squared_error
 
 
 def _to_datetime_col(df: pd.DataFrame, col: str) -> pd.Series:
@@ -234,6 +235,141 @@ class TrainArtifacts:
     cat_cols: list[str]
 
 
+def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+def make_time_series_folds(
+    train_df: pd.DataFrame,
+    n_folds: int,
+    val_days: int,
+    step_days: int,
+    min_train_days: int,
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    start = _to_datetime_col(train_df, "delivery_start")
+    days = pd.Series(start.dt.floor("D").unique()).sort_values().reset_index(drop=True)
+    if days.empty:
+        return []
+
+    max_day = days.iloc[-1]
+    folds: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    for i in range(n_folds):
+        val_end = max_day - pd.Timedelta(days=step_days * i)
+        val_start = val_end - pd.Timedelta(days=val_days)
+        train_start = days.iloc[0]
+        min_train_end = train_start + pd.Timedelta(days=min_train_days)
+        if val_start <= min_train_end:
+            break
+        folds.append((val_start, val_end))
+    folds.reverse()
+    return folds
+
+
+def run_time_series_cv(
+    train_df_raw: pd.DataFrame,
+    n_folds: int,
+    val_days: int,
+    step_days: int,
+    min_train_days: int,
+) -> tuple[float | None, pd.DataFrame]:
+    folds = make_time_series_folds(
+        train_df=train_df_raw,
+        n_folds=n_folds,
+        val_days=val_days,
+        step_days=step_days,
+        min_train_days=min_train_days,
+    )
+    if not folds:
+        print("CV skipped: not enough history for requested folds.")
+        return None, pd.DataFrame()
+
+    start_all = _to_datetime_col(train_df_raw, "delivery_start")
+    fold_rows: list[dict[str, object]] = []
+    oof = pd.Series(index=train_df_raw.index, dtype=float)
+
+    print(
+        f"CV start: folds={len(folds)}, val_days={val_days}, step_days={step_days}, "
+        f"min_train_days={min_train_days}"
+    )
+    for fold_idx, (val_start, val_end) in enumerate(folds, start=1):
+        tr_mask = start_all < val_start
+        va_mask = (start_all >= val_start) & (start_all < val_end)
+        tr = train_df_raw.loc[tr_mask].copy()
+        va = train_df_raw.loc[va_mask].copy()
+        if tr.empty or va.empty:
+            print(f"CV fold {fold_idx}: skipped (empty train/val)")
+            continue
+
+        print(
+            f"CV fold {fold_idx}/{len(folds)} | "
+            f"train={len(tr)} val={len(va)} | "
+            f"val_range=[{val_start.date()} -> {val_end.date()})"
+        )
+
+        tr_feat, va_feat = build_feature_table(tr, va.drop(columns=["target"]).copy())
+
+        base_drop = {"id", "target", "delivery_start", "delivery_end"}
+        feat_cols = [c for c in tr_feat.columns if c not in base_drop]
+        cat_cols = [
+            c
+            for c in ["market", "hour_x_market", "dow_x_market", "month_x_market"]
+            if c in feat_cols
+        ]
+
+        artifacts = train_global_and_local_models(tr_feat, feat_cols, cat_cols)
+        va_feat = va_feat.copy()
+        va_feat["global_pred_feature"] = artifacts.global_model.predict(va_feat[feat_cols])
+
+        pred = np.full(len(va_feat), np.nan, dtype=float)
+        key = va_feat[["market"]].copy()
+        for market, idx in key.groupby("market", dropna=False).groups.items():
+            model = artifacts.local_models.get(str(market))
+            if model is None:
+                pred[idx] = va_feat.loc[idx, "global_pred_feature"].to_numpy(dtype=float)
+            else:
+                pred[idx] = model.predict(va_feat.loc[idx, artifacts.feature_cols])
+        if np.isnan(pred).any():
+            raise ValueError(f"NaNs in CV predictions for fold {fold_idx}")
+
+        fold_rmse = _rmse(va["target"].to_numpy(dtype=float), pred)
+        print(f"CV fold {fold_idx} RMSE={fold_rmse:.6f}")
+        fold_rows.append(
+            {
+                "fold": fold_idx,
+                "val_start": str(val_start.date()),
+                "val_end": str(val_end.date()),
+                "rmse": fold_rmse,
+                "train_rows": len(tr),
+                "val_rows": len(va),
+            }
+        )
+
+        tmp = pd.DataFrame(
+            {
+                "idx": va.index.to_numpy(),
+                "market": va["market"].to_numpy(),
+                "y_true": va["target"].to_numpy(dtype=float),
+                "y_pred": pred,
+            }
+        )
+        for market, sdf in tmp.groupby("market"):
+            m_rmse = _rmse(sdf["y_true"].to_numpy(), sdf["y_pred"].to_numpy())
+            print(f"  - {market}: RMSE={m_rmse:.6f} (n={len(sdf)})")
+        oof.loc[va.index] = pred
+
+    coverage = float(oof.notna().mean())
+    overall = None
+    if coverage > 0.0:
+        valid = oof.notna()
+        overall = _rmse(
+            train_df_raw.loc[valid, "target"].to_numpy(dtype=float),
+            oof.loc[valid].to_numpy(dtype=float),
+        )
+    print(f"CV OOF coverage: {coverage:.4%}")
+    print(f"CV OOF RMSE: {overall if overall is not None else 'None'}")
+    return overall, pd.DataFrame(fold_rows)
+
+
 def train_global_and_local_models(train_df: pd.DataFrame, feature_cols: list[str], cat_cols: list[str]) -> TrainArtifacts:
     global_model = CatBoostRegressor(
         loss_function="RMSE",
@@ -303,6 +439,11 @@ def main() -> None:
     parser.add_argument("--name", default="per_market_interactions")
     parser.add_argument("--exclude-2023", action="store_true")
     parser.add_argument("--exclude-2023-keep-from-month", type=int, default=10)
+    parser.add_argument("--cv", action="store_true")
+    parser.add_argument("--cv-folds", type=int, default=5)
+    parser.add_argument("--cv-val-days", type=int, default=14)
+    parser.add_argument("--cv-step-days", type=int, default=14)
+    parser.add_argument("--cv-min-train-days", type=int, default=90)
     args = parser.parse_args()
 
     train_df = pd.read_csv(args.train_path)
@@ -311,6 +452,17 @@ def main() -> None:
 
     if args.exclude_2023:
         train_df = apply_exclude_2023(train_df, keep_from_month=args.exclude_2023_keep_from_month)
+
+    cv_rmse = None
+    cv_details = pd.DataFrame()
+    if args.cv:
+        cv_rmse, cv_details = run_time_series_cv(
+            train_df_raw=train_df,
+            n_folds=args.cv_folds,
+            val_days=args.cv_val_days,
+            step_days=args.cv_step_days,
+            min_train_days=args.cv_min_train_days,
+        )
 
     train_feat, test_feat = build_feature_table(train_df, test_df)
     test_with_key = test_feat[["id", "market"]].copy()
@@ -361,6 +513,11 @@ def main() -> None:
     print(f"Features used: {len(artifacts.feature_cols)}")
     print(f"Categorical features: {artifacts.cat_cols}")
     print(f"Markets modeled: {sorted(artifacts.local_models.keys())}")
+    print(f"CV RMSE: {cv_rmse}")
+    if not cv_details.empty:
+        cv_path = run_dir / "cv_results.csv"
+        cv_details.to_csv(cv_path, index=False)
+        print(f"Saved CV details: {cv_path}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,15 @@
+Global OOF coverage: 85.16%
+Run ID: 20260219-2113_eb689e0_per_market_v1
+CatBoost device: CPU (devices=0)
+Run mode: FULL
+Using 246 features total
+Categorical (1): ['month_x_market']
+Inference mode: recursive first 12 steps, mid-horizon expert next 48 steps, then long-horizon expert
+Blending mode: residual baseline + OOF stacker + global/local signal
+Experts: normal + spike + peak + time specialists (soft-gated)
+Market A | Fold 1/5 | Residual blend RMSE=327.668689
+Market A | Fold 2/5 | Residual blend RMSE=81.294567
+Market A | Fold 3/5 | Residual blend RMSE=72.934979
+Market A | Fold 4/5 | Residual blend RMSE=65.727178
+Market A | Fold 5/5 | Residual blend RMSE=69.178825
+Market A | Fold diagnostics | mean_all=123.360848, mean_last2=67.453001, std=102.285254, worst=327.668689

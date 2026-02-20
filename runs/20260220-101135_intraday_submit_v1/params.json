@@ -1,0 +1,12 @@
+{
+  "config_name": "intraday_submit_v1",
+  "exclude_2023": true,
+  "exclude_2023_keep_from_month": 10,
+  "num_all_features": 130,
+  "num_fallback_features": 107,
+  "num_test_rows": 13098,
+  "num_train_rows": 99853,
+  "run_id": "20260220-101135_intraday_submit_v1",
+  "seed": 42,
+  "started_at": "2026-02-20T10:11:35.121004+00:00"
+}

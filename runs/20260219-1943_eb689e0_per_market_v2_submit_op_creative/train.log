@@ -1,0 +1,32 @@
+Excluded most 2023 observations from training: removed 32755 rows, kept 12169 rows from 2023-10 onward
+Global OOF coverage: 83.63%
+Run ID: 20260219-1943_eb689e0_per_market_v2_submit_op_creative
+CatBoost device: CPU (devices=0)
+Run mode: FULL
+Using 246 features total
+Categorical (1): ['month_x_market']
+Inference mode: recursive first 12 steps, mid-horizon expert next 48 steps, then long-horizon expert
+Blending mode: residual baseline + OOF stacker + global/local signal
+Experts: normal + spike + peak + time specialists (soft-gated)
+Market A | Fold 1/5 | Residual blend RMSE=100.730429
+Market A | Fold 2/5 | Residual blend RMSE=100.955302
+Market A | Fold 3/5 | Residual blend RMSE=59.659675
+Market A | Fold 4/5 | Residual blend RMSE=56.155920
+Market A | Fold 5/5 | Residual blend RMSE=62.806551
+Market A | Fold diagnostics | mean_all=76.061576, mean_last2=59.481236, std=20.343073, worst=100.955302
+Market A | OOF RMSE=70.757471 | learned stacker with 9 features
+Market B | Fold 1/5 | Residual blend RMSE=85.217054
+Market B | Fold 2/5 | Residual blend RMSE=121.225976
+Market B | Fold 3/5 | Residual blend RMSE=45.515732
+Market B | Fold 4/5 | Residual blend RMSE=49.880006
+Market B | Fold 5/5 | Residual blend RMSE=35.067516
+Market B | Fold diagnostics | mean_all=67.381257, mean_last2=42.473761, std=31.767726, worst=121.225976
+Market B | OOF RMSE=62.368083 | learned stacker with 9 features
+Market C | Fold 1/5 | Residual blend RMSE=82.800954
+Market C | Fold 2/5 | Residual blend RMSE=135.144842
+Market C | Fold 3/5 | Residual blend RMSE=29.873669
+Market C | Fold 4/5 | Residual blend RMSE=30.934814
+Market C | Fold 5/5 | Residual blend RMSE=22.477277
+Market C | Fold diagnostics | mean_all=60.246311, mean_last2=26.706046, std=43.189496, worst=135.144842
+Market C | OOF RMSE=68.976910 | learned stacker with 9 features
+Market D | Fold 1/5 | Residual blend RMSE=221.153886

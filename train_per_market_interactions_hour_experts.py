@@ -607,6 +607,8 @@ class TrainArtifacts:
     local_models: dict[str, CatBoostRegressor]
     local_tail_models: dict[str, CatBoostRegressor]
     local_gate_models: dict[str, CatBoostClassifier]
+    local_hour_models: dict[str, dict[str, CatBoostRegressor]]
+    local_hour_model_counts: dict[str, dict[str, int]]
     feature_cols: list[str]
     cat_cols: list[str]
     local_target_is_residual: bool
@@ -622,6 +624,10 @@ class TrainArtifacts:
     tail_model_mode: str
     tail_weight: float
     tail_min_rows: int
+    use_hour_experts: bool
+    hour_expert_mode: str
+    hour_expert_min_rows: int
+    hour_expert_weight: float
 
 
 def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -746,6 +752,22 @@ def _blend_tail_expert_prediction(
     return normal_pred + weight * delta
 
 
+def _hour_regime_from_hour(hour: pd.Series, mode: str) -> pd.Series:
+    h = pd.to_numeric(hour, errors="coerce").fillna(-1).astype(int)
+    if mode == "hour":
+        return h.map(lambda x: f"h{x:02d}" if 0 <= x <= 23 else "h_na")
+    if mode == "block5":
+        out = pd.Series(index=h.index, dtype=object)
+        out.loc[(h >= 0) & (h <= 5)] = "night_00_05"
+        out.loc[(h >= 6) & (h <= 10)] = "morning_06_10"
+        out.loc[(h >= 11) & (h <= 16)] = "day_11_16"
+        out.loc[(h >= 17) & (h <= 20)] = "peak_17_20"
+        out.loc[(h >= 21) & (h <= 23)] = "late_21_23"
+        out = out.fillna("h_na")
+        return out
+    raise ValueError(f"Unsupported hour expert mode: {mode}")
+
+
 def _predict_local_expert(
     artifacts: TrainArtifacts,
     market: str,
@@ -754,25 +776,43 @@ def _predict_local_expert(
     normal_model = artifacts.local_models.get(str(market))
     if normal_model is None:
         raise KeyError(f"Missing normal local model for market={market}")
-    normal_pred = _predict_point(normal_model, X[artifacts.feature_cols])
+    local_pred = _predict_point(normal_model, X[artifacts.feature_cols])
 
-    if not artifacts.use_tail_experts:
-        return normal_pred
-    tail_model = artifacts.local_tail_models.get(str(market))
-    gate_model = artifacts.local_gate_models.get(str(market))
-    if tail_model is None or gate_model is None:
-        return normal_pred
+    if artifacts.use_tail_experts:
+        tail_model = artifacts.local_tail_models.get(str(market))
+        gate_model = artifacts.local_gate_models.get(str(market))
+        if tail_model is not None and gate_model is not None:
+            tail_pred = _predict_point(tail_model, X[artifacts.feature_cols])
+            tail_prob = _predict_tail_probability(gate_model, X[artifacts.feature_cols])
+            local_pred = _blend_tail_expert_prediction(
+                normal_pred=local_pred,
+                tail_pred=tail_pred,
+                tail_prob=tail_prob,
+                gate_threshold=artifacts.tail_gate_threshold,
+                blend_mode=artifacts.tail_blend_mode,
+                delta_clip=artifacts.tail_delta_clip,
+            )
+    if not artifacts.use_hour_experts:
+        return local_pred
 
-    tail_pred = _predict_point(tail_model, X[artifacts.feature_cols])
-    tail_prob = _predict_tail_probability(gate_model, X[artifacts.feature_cols])
-    return _blend_tail_expert_prediction(
-        normal_pred=normal_pred,
-        tail_pred=tail_pred,
-        tail_prob=tail_prob,
-        gate_threshold=artifacts.tail_gate_threshold,
-        blend_mode=artifacts.tail_blend_mode,
-        delta_clip=artifacts.tail_delta_clip,
-    )
+    hour_models = artifacts.local_hour_models.get(str(market), {})
+    if not hour_models:
+        return local_pred
+    hour_counts = artifacts.local_hour_model_counts.get(str(market), {})
+    regime = _hour_regime_from_hour(X["hour"], artifacts.hour_expert_mode).reset_index(drop=True)
+
+    hour_adj = np.zeros(len(X), dtype=float)
+    for r, pos_idx in regime.groupby(regime, dropna=False).groups.items():
+        model = hour_models.get(str(r))
+        if model is None:
+            continue
+        pos = np.asarray(pos_idx, dtype=int)
+        sub = X.iloc[pos]
+        raw_adj = _predict_point(model, sub[artifacts.feature_cols])
+        n = float(hour_counts.get(str(r), 0))
+        shrink = n / (n + float(max(artifacts.hour_expert_min_rows, 1)))
+        hour_adj[pos] = float(artifacts.hour_expert_weight) * shrink * raw_adj
+    return local_pred + hour_adj
 
 
 def make_time_series_folds(
@@ -828,6 +868,10 @@ def run_time_series_cv(
     tail_gate_threshold: float,
     tail_blend_mode: str,
     tail_delta_clip: float | None,
+    use_hour_experts: bool,
+    hour_expert_mode: str,
+    hour_expert_min_rows: int,
+    hour_expert_weight: float,
 ) -> tuple[float | None, pd.DataFrame, pd.DataFrame]:
     folds = make_time_series_folds(
         train_df=train_df_raw,
@@ -902,6 +946,10 @@ def run_time_series_cv(
             tail_gate_threshold=tail_gate_threshold,
             tail_blend_mode=tail_blend_mode,
             tail_delta_clip=tail_delta_clip,
+            use_hour_experts=use_hour_experts,
+            hour_expert_mode=hour_expert_mode,
+            hour_expert_min_rows=hour_expert_min_rows,
+            hour_expert_weight=hour_expert_weight,
         )
         va_feat = va_feat.copy()
         va_feat["global_pred_feature"] = _predict_point(artifacts.global_model, va_feat[feat_cols])
@@ -994,6 +1042,10 @@ def train_global_and_local_models(
     tail_gate_threshold: float = 0.95,
     tail_blend_mode: str = "soft",
     tail_delta_clip: float | None = 250.0,
+    use_hour_experts: bool = False,
+    hour_expert_mode: str = "block5",
+    hour_expert_min_rows: int = 240,
+    hour_expert_weight: float = 0.6,
 ) -> TrainArtifacts:
     if not (0.0 < tail_quantile_upper < 1.0):
         raise ValueError("--tail-quantile-upper must be in (0,1)")
@@ -1003,6 +1055,8 @@ def train_global_and_local_models(
         raise ValueError("--tail-quantile-lower must be < --tail-quantile-upper")
     if not (0.0 <= tail_gate_threshold < 1.0):
         raise ValueError("--tail-gate-threshold must be in [0,1)")
+    if hour_expert_min_rows < 1:
+        raise ValueError("--hour-expert-min-rows must be >= 1")
 
     transformed_target, t_state = _fit_target_transform(
         train_df["target"].to_numpy(dtype=float),
@@ -1032,6 +1086,8 @@ def train_global_and_local_models(
     local_models: dict[str, CatBoostRegressor] = {}
     local_tail_models: dict[str, CatBoostRegressor] = {}
     local_gate_models: dict[str, CatBoostClassifier] = {}
+    local_hour_models: dict[str, dict[str, CatBoostRegressor]] = {}
+    local_hour_model_counts: dict[str, dict[str, int]] = {}
     for market, mdf in train_df.groupby("market", dropna=False):
         normal_model = CatBoostRegressor(
             loss_function=loss_function,
@@ -1056,83 +1112,143 @@ def train_global_and_local_models(
         local_models[str(market)] = normal_model
         print(f"Trained local model for {market} ({len(mdf)} rows)")
 
-        if not use_tail_experts:
-            continue
-
-        tail_mask = _compute_tail_mask_per_market(
-            mdf["target"],
-            mdf["market"],
-            label_mode=tail_label_mode,
-            quantile_upper=tail_quantile_upper,
-            quantile_lower=tail_quantile_lower,
-        )
-        n_tail = int(tail_mask.sum())
-        if n_tail < tail_min_rows or n_tail >= len(mdf):
-            print(
-                f"Skipped tail expert for {market}: "
-                f"tail_rows={n_tail}, required_min={tail_min_rows}"
+        tail_model_for_market: CatBoostRegressor | None = None
+        gate_model_for_market: CatBoostClassifier | None = None
+        if use_tail_experts:
+            tail_mask = _compute_tail_mask_per_market(
+                mdf["target"],
+                mdf["market"],
+                label_mode=tail_label_mode,
+                quantile_upper=tail_quantile_upper,
+                quantile_lower=tail_quantile_lower,
             )
-            continue
+            n_tail = int(tail_mask.sum())
+            if n_tail < tail_min_rows or n_tail >= len(mdf):
+                print(
+                    f"Skipped tail expert for {market}: "
+                    f"tail_rows={n_tail}, required_min={tail_min_rows}"
+                )
+            else:
+                gate_labels = tail_mask.astype(int)
+                if gate_labels.min() == gate_labels.max():
+                    print(f"Skipped tail gate for {market}: single-class labels")
+                else:
+                    gate_model = CatBoostClassifier(
+                        loss_function="Logloss",
+                        eval_metric="AUC",
+                        iterations=900,
+                        learning_rate=0.04,
+                        depth=6,
+                        l2_leaf_reg=12.0,
+                        auto_class_weights="Balanced",
+                        random_seed=42,
+                        verbose=0,
+                    )
+                    gate_model.fit(mdf[local_feature_cols], gate_labels, cat_features=local_cat_cols)
+                    local_gate_models[str(market)] = gate_model
 
-        gate_labels = tail_mask.astype(int)
-        if gate_labels.min() == gate_labels.max():
-            print(f"Skipped tail gate for {market}: single-class labels")
-            continue
+                    tail_model = CatBoostRegressor(
+                        loss_function=loss_function,
+                        eval_metric="RMSE",
+                        iterations=2200,
+                        learning_rate=0.03,
+                        depth=7,
+                        l2_leaf_reg=24.0,
+                        bagging_temperature=0.6,
+                        random_strength=1.1,
+                        random_seed=42,
+                        verbose=0,
+                    )
+                    if tail_model_mode == "tail_only":
+                        tail_model.fit(
+                            mdf.loc[tail_mask, local_feature_cols],
+                            local_target_np[tail_mask],
+                            cat_features=local_cat_cols,
+                        )
+                    elif tail_model_mode == "weighted_all":
+                        sample_weight = np.ones(len(mdf), dtype=float)
+                        sample_weight[tail_mask] = float(tail_weight)
+                        tail_model.fit(
+                            mdf[local_feature_cols],
+                            local_target_np,
+                            cat_features=local_cat_cols,
+                            sample_weight=sample_weight,
+                        )
+                    else:
+                        raise ValueError(f"Unsupported tail model mode: {tail_model_mode}")
+                    local_tail_models[str(market)] = tail_model
+                    tail_model_for_market = tail_model
+                    gate_model_for_market = gate_model
+                    print(
+                        f"Trained tail expert for {market} "
+                        f"(tail_rows={n_tail}, mode={tail_model_mode})"
+                    )
 
-        gate_model = CatBoostClassifier(
-            loss_function="Logloss",
-            eval_metric="AUC",
-            iterations=900,
-            learning_rate=0.04,
-            depth=6,
-            l2_leaf_reg=12.0,
-            auto_class_weights="Balanced",
-            random_seed=42,
-            verbose=0,
-        )
-        gate_model.fit(mdf[local_feature_cols], gate_labels, cat_features=local_cat_cols)
-        local_gate_models[str(market)] = gate_model
+        # Optional hour-regime residual specialist on top of local prediction.
+        if use_hour_experts:
+            # Recompute local base prediction (normal + optional tail blend).
+            base_local_pred = _predict_point(normal_model, mdf[local_feature_cols])
+            if tail_model_for_market is not None and gate_model_for_market is not None:
+                tail_pred_for_market = _predict_point(tail_model_for_market, mdf[local_feature_cols])
+                tail_prob_for_market = _predict_tail_probability(gate_model_for_market, mdf[local_feature_cols])
+                base_local_pred = _blend_tail_expert_prediction(
+                    normal_pred=base_local_pred,
+                    tail_pred=tail_pred_for_market,
+                    tail_prob=tail_prob_for_market,
+                    gate_threshold=tail_gate_threshold,
+                    blend_mode=tail_blend_mode,
+                    delta_clip=tail_delta_clip,
+                )
 
-        tail_model = CatBoostRegressor(
-            loss_function=loss_function,
-            eval_metric="RMSE",
-            iterations=2200,
-            learning_rate=0.03,
-            depth=7,
-            l2_leaf_reg=24.0,
-            bagging_temperature=0.6,
-            random_strength=1.1,
-            random_seed=42,
-            verbose=0,
-        )
-        if tail_model_mode == "tail_only":
-            tail_model.fit(
-                mdf.loc[tail_mask, local_feature_cols],
-                local_target_np[tail_mask],
-                cat_features=local_cat_cols,
-            )
-        elif tail_model_mode == "weighted_all":
-            sample_weight = np.ones(len(mdf), dtype=float)
-            sample_weight[tail_mask] = float(tail_weight)
-            tail_model.fit(
-                mdf[local_feature_cols],
-                local_target_np,
-                cat_features=local_cat_cols,
-                sample_weight=sample_weight,
-            )
-        else:
-            raise ValueError(f"Unsupported tail model mode: {tail_model_mode}")
-        local_tail_models[str(market)] = tail_model
-        print(
-            f"Trained tail expert for {market} "
-            f"(tail_rows={n_tail}, mode={tail_model_mode})"
-        )
+            if local_residual_modeling:
+                base_total_pred = mdf["global_pred_feature"].to_numpy(dtype=float) + base_local_pred
+            else:
+                base_total_pred = base_local_pred
+            hour_target = mdf["target_transformed"].to_numpy(dtype=float) - base_total_pred
+
+            regime = _hour_regime_from_hour(mdf["hour"], hour_expert_mode).reset_index(drop=True)
+            hour_models_for_market: dict[str, CatBoostRegressor] = {}
+            hour_counts_for_market: dict[str, int] = {}
+            for reg, pos_idx in regime.groupby(regime, dropna=False).groups.items():
+                pos = np.asarray(pos_idx, dtype=int)
+                n_reg = int(len(pos))
+                if n_reg < hour_expert_min_rows:
+                    continue
+                reg_model = CatBoostRegressor(
+                    loss_function=loss_function,
+                    eval_metric="RMSE",
+                    iterations=1200,
+                    learning_rate=0.03,
+                    depth=6,
+                    l2_leaf_reg=26.0,
+                    bagging_temperature=0.7,
+                    random_strength=1.1,
+                    random_seed=42,
+                    verbose=0,
+                )
+                reg_model.fit(
+                    mdf.iloc[pos][local_feature_cols],
+                    hour_target[pos],
+                    cat_features=local_cat_cols,
+                )
+                hour_models_for_market[str(reg)] = reg_model
+                hour_counts_for_market[str(reg)] = n_reg
+
+            if hour_models_for_market:
+                local_hour_models[str(market)] = hour_models_for_market
+                local_hour_model_counts[str(market)] = hour_counts_for_market
+                print(
+                    f"Trained hour experts for {market}: "
+                    f"{sorted(hour_models_for_market.keys())}"
+                )
 
     return TrainArtifacts(
         global_model=global_model,
         local_models=local_models,
         local_tail_models=local_tail_models,
         local_gate_models=local_gate_models,
+        local_hour_models=local_hour_models,
+        local_hour_model_counts=local_hour_model_counts,
         feature_cols=local_feature_cols,
         cat_cols=cat_cols,
         local_target_is_residual=local_residual_modeling,
@@ -1148,6 +1264,10 @@ def train_global_and_local_models(
         tail_model_mode=tail_model_mode,
         tail_weight=tail_weight,
         tail_min_rows=tail_min_rows,
+        use_hour_experts=use_hour_experts,
+        hour_expert_mode=hour_expert_mode,
+        hour_expert_min_rows=hour_expert_min_rows,
+        hour_expert_weight=hour_expert_weight,
     )
 
 
@@ -1191,12 +1311,14 @@ def build_feature_table(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Per-market intraday training with tailored and cross-market features.")
+    parser = argparse.ArgumentParser(
+        description="Per-market intraday training with tailored and cross-market features plus optional hour experts."
+    )
     parser.add_argument("--train-path", default="data/train.csv")
     parser.add_argument("--test-path", default="data/test_for_participants.csv")
     parser.add_argument("--sample-submission", default="data/sample_submission.csv")
     parser.add_argument("--out-dir", default="runs")
-    parser.add_argument("--name", default="per_market_interactions")
+    parser.add_argument("--name", default="per_market_interactions_hour_experts")
     parser.add_argument("--exclude-2023", action="store_true")
     parser.add_argument("--exclude-2023-keep-from-month", type=int, default=10)
     parser.add_argument("--cv", action="store_true")
@@ -1331,6 +1453,30 @@ def main() -> None:
         help="Optional cap on tail minus normal adjustment in transformed space (<=0 disables clip).",
     )
     parser.add_argument(
+        "--use-hour-experts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable additional per-market hour-of-day residual experts (default: disabled).",
+    )
+    parser.add_argument(
+        "--hour-expert-mode",
+        choices=["block5", "hour"],
+        default="block5",
+        help="Hour expert grouping: block5 regimes or full hour buckets.",
+    )
+    parser.add_argument(
+        "--hour-expert-min-rows",
+        type=int,
+        default=240,
+        help="Minimum rows required to train a market-hour expert (default: 240).",
+    )
+    parser.add_argument(
+        "--hour-expert-weight",
+        type=float,
+        default=0.6,
+        help="Global scaling applied to hour-expert correction (default: 0.6).",
+    )
+    parser.add_argument(
         "--save-models",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1395,6 +1541,10 @@ def main() -> None:
             tail_gate_threshold=args.tail_gate_threshold,
             tail_blend_mode=args.tail_blend_mode,
             tail_delta_clip=tail_delta_clip,
+            use_hour_experts=args.use_hour_experts,
+            hour_expert_mode=args.hour_expert_mode,
+            hour_expert_min_rows=args.hour_expert_min_rows,
+            hour_expert_weight=args.hour_expert_weight,
         )
 
     train_feat, test_feat = build_feature_table(
@@ -1436,6 +1586,10 @@ def main() -> None:
         tail_gate_threshold=args.tail_gate_threshold,
         tail_blend_mode=args.tail_blend_mode,
         tail_delta_clip=tail_delta_clip,
+        use_hour_experts=args.use_hour_experts,
+        hour_expert_mode=args.hour_expert_mode,
+        hour_expert_min_rows=args.hour_expert_min_rows,
+        hour_expert_weight=args.hour_expert_weight,
     )
 
     # Add global prediction feature to test and run local market experts.
@@ -1502,6 +1656,15 @@ def main() -> None:
         )
         print(f"Tail models trained: {len(artifacts.local_tail_models)}")
         print(f"Gate models trained: {len(artifacts.local_gate_models)}")
+    print(f"Hour experts enabled: {artifacts.use_hour_experts}")
+    if artifacts.use_hour_experts:
+        print(
+            "Hour expert settings: "
+            f"mode={artifacts.hour_expert_mode}, "
+            f"min_rows={artifacts.hour_expert_min_rows}, "
+            f"weight={artifacts.hour_expert_weight}"
+        )
+        print(f"Hour expert markets trained: {len(artifacts.local_hour_models)}")
     print(f"Target transform: {artifacts.target_transform_state.to_metadata()}")
     print(f"CV RMSE: {cv_rmse}")
     if not cv_details.empty:
@@ -1541,11 +1704,28 @@ def main() -> None:
             model.save_model(local_path)
             local_gate_model_paths[str(market)] = str(local_path.name)
 
+        local_hour_model_paths: dict[str, dict[str, str]] = {}
+        for market, models_by_regime in artifacts.local_hour_models.items():
+            safe_market = str(market).replace(" ", "_")
+            local_hour_model_paths[str(market)] = {}
+            for regime, model in models_by_regime.items():
+                safe_regime = (
+                    str(regime)
+                    .replace(" ", "_")
+                    .replace("/", "_")
+                    .replace("-", "_")
+                )
+                local_path = models_dir / f"local_hour_model_{safe_market}_{safe_regime}.cbm"
+                model.save_model(local_path)
+                local_hour_model_paths[str(market)][str(regime)] = str(local_path.name)
+
         model_meta = {
             "global_model": str(global_model_path.name),
             "local_models": local_model_paths,
             "local_tail_models": local_tail_model_paths,
             "local_gate_models": local_gate_model_paths,
+            "local_hour_models": local_hour_model_paths,
+            "local_hour_model_counts": artifacts.local_hour_model_counts,
             "feature_cols": artifacts.feature_cols,
             "cat_cols": artifacts.cat_cols,
             "local_target_is_residual": artifacts.local_target_is_residual,
@@ -1562,6 +1742,12 @@ def main() -> None:
                 "tail_weight": artifacts.tail_weight,
                 "tail_min_rows": artifacts.tail_min_rows,
             },
+            "hour_expert_config": {
+                "use_hour_experts": artifacts.use_hour_experts,
+                "hour_expert_mode": artifacts.hour_expert_mode,
+                "hour_expert_min_rows": artifacts.hour_expert_min_rows,
+                "hour_expert_weight": artifacts.hour_expert_weight,
+            },
             "target_transform": artifacts.target_transform_state.to_metadata(),
             "candidate_features_before_global_pred": candidate_features,
             "train_args": vars(args),
@@ -1573,10 +1759,10 @@ def main() -> None:
         print(f"Saved model metadata: {model_meta_path}")
 
         if args.save_shap:
-            if artifacts.use_tail_experts:
+            if artifacts.use_tail_experts or artifacts.use_hour_experts:
                 print(
                     "Note: SHAP export uses saved normal experts for local attributions; "
-                    "gate/tail blending logic is not decomposed in the SHAP output."
+                    "gate/tail/hour blending logic is not decomposed in the SHAP output."
                 )
             shap_cmd = [
                 Path(__file__).with_name("shap_from_saved_models.py").as_posix(),

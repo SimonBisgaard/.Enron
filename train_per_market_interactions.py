@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -444,6 +445,12 @@ def main() -> None:
     parser.add_argument("--cv-val-days", type=int, default=14)
     parser.add_argument("--cv-step-days", type=int, default=14)
     parser.add_argument("--cv-min-train-days", type=int, default=90)
+    parser.add_argument(
+        "--save-models",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save fitted global/local CatBoost models and metadata in the run directory (default: enabled).",
+    )
     args = parser.parse_args()
 
     train_df = pd.read_csv(args.train_path)
@@ -518,6 +525,34 @@ def main() -> None:
         cv_path = run_dir / "cv_results.csv"
         cv_details.to_csv(cv_path, index=False)
         print(f"Saved CV details: {cv_path}")
+
+    if args.save_models:
+        models_dir = run_dir / "models"
+        models_dir.mkdir(parents=True, exist_ok=True)
+
+        global_model_path = models_dir / "global_model.cbm"
+        artifacts.global_model.save_model(global_model_path)
+
+        local_model_paths: dict[str, str] = {}
+        for market, model in artifacts.local_models.items():
+            safe_market = str(market).replace(" ", "_")
+            local_path = models_dir / f"local_model_{safe_market}.cbm"
+            model.save_model(local_path)
+            local_model_paths[str(market)] = str(local_path.name)
+
+        model_meta = {
+            "global_model": str(global_model_path.name),
+            "local_models": local_model_paths,
+            "feature_cols": artifacts.feature_cols,
+            "cat_cols": artifacts.cat_cols,
+            "candidate_features_before_global_pred": candidate_features,
+            "train_args": vars(args),
+        }
+        model_meta_path = run_dir / "model_metadata.json"
+        model_meta_path.write_text(json.dumps(model_meta, indent=2))
+
+        print(f"Saved models dir: {models_dir}")
+        print(f"Saved model metadata: {model_meta_path}")
 
 
 if __name__ == "__main__":

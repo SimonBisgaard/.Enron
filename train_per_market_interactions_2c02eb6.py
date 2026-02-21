@@ -4,12 +4,14 @@ import argparse
 import hashlib
 import json
 import platform
+import re
 import subprocess
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -40,6 +42,52 @@ REDUNDANT_FEATURE_DROP_LIST = [
     # Exact duplicate indicator.
     "is_evening_peak",
 ]
+
+CORE_FORECAST_FEATURES = {
+    "load_forecast",
+    "wind_forecast",
+    "solar_forecast",
+}
+
+KEY_METEO_FEATURES = {
+    "wind_speed_80m",
+    "wind_speed_10m",
+    "wind_gust_speed_10m",
+    "wind_direction_80m",
+    "air_temperature_2m",
+    "dew_point_temperature_2m",
+    "apparent_temperature_2m",
+    "relative_humidity_2m",
+    "cloud_cover_total",
+    "cloud_cover_low",
+    "precipitation_amount",
+    "global_horizontal_irradiance",
+    "direct_normal_irradiance",
+    "diffuse_horizontal_irradiance",
+    "convective_available_potential_energy",
+    "convective_inhibition",
+    "freezing_level_height",
+    "gustiness_10m",
+    "gust_ratio_10m",
+    "ws_ratio_80_10",
+    "wind_dir_sin",
+    "wind_dir_cos",
+    "clear_sky_proxy",
+    "cloud_low_share",
+    "temp_dew_spread",
+    "temp_apparent_gap",
+}
+
+ROBUST_POSITIVE_FEATURES = {
+    "solar_forecast_diff_1",
+    "wind_forecast_diff_1",
+    "wind_forecast_diff_6",
+    "wind_forecast_lag_6",
+    "solar_forecast_roll_mean_6",
+    "wind_forecast_roll_mean_24",
+    "temp_apparent_gap",
+    "convective_available_potential_energy",
+}
 
 
 def _to_datetime_col(df: pd.DataFrame, col: str) -> pd.Series:
@@ -335,8 +383,286 @@ class TrainArtifacts:
     local_target_is_residual: bool
 
 
+@dataclass
+class PermutationEvalOutputs:
+    perm_importance_by_fold: pd.DataFrame
+    perm_importance_summary: pd.DataFrame
+    corr_groups: pd.DataFrame
+    perm_importance_groups_by_fold: pd.DataFrame
+    perm_importance_groups_summary: pd.DataFrame
+    perm_importance_families: pd.DataFrame
+    perm_importance_families_summary: pd.DataFrame
+    runtime_seconds: float
+    n_features_evaluated: int
+    n_groups_evaluated: int
+    n_family_evaluations: int
+
+
 def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+def _format_duration(seconds: float) -> str:
+    if not np.isfinite(seconds):
+        return "?"
+    total = max(int(round(seconds)), 0)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _progress_bar(completed: int, total: int, width: int = 24) -> str:
+    safe_total = max(total, 1)
+    ratio = min(max(completed / safe_total, 0.0), 1.0)
+    filled = int(round(ratio * width))
+    filled = min(max(filled, 0), width)
+    return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
+
+
+@dataclass
+class LoopProgress:
+    label: str
+    total: int
+    min_interval_seconds: float = 1.0
+    start_time: float = field(default_factory=time.perf_counter)
+    last_emit_time: float = 0.0
+
+    def update(self, completed: int, *, force: bool = False) -> None:
+        done = min(max(completed, 0), max(self.total, 0))
+        now = time.perf_counter()
+        should_emit = force or done >= self.total or (now - self.last_emit_time) >= self.min_interval_seconds
+        if not should_emit:
+            return
+
+        elapsed = now - self.start_time
+        pct = (100.0 * done / self.total) if self.total > 0 else 100.0
+        rate = (done / elapsed) if elapsed > 0 else 0.0
+        remaining = max(self.total - done, 0)
+        eta = (remaining / rate) if rate > 1e-12 else float("nan")
+        msg = (
+            f"{self.label} {_progress_bar(done, self.total)} "
+            f"{done}/{self.total} ({pct:5.1f}%) "
+            f"elapsed={_format_duration(elapsed)} eta={_format_duration(eta)}"
+        )
+
+        if sys.stdout.isatty() and not force and done < self.total:
+            print(msg, end="\r", flush=True)
+        else:
+            print(msg)
+        self.last_emit_time = now
+
+    def finish(self) -> None:
+        self.update(self.total, force=True)
+
+
+def _stable_hash_int(name: str) -> int:
+    digest = hashlib.sha256(name.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False)
+
+
+def _permutation_seed(base_seed: int, fold_index: int, name: str) -> int:
+    return int(base_seed + fold_index * 1000 + (_stable_hash_int(name) % 1_000_000_000))
+
+
+def _predict_with_global_local_pipeline(
+    feat_df: pd.DataFrame,
+    *,
+    artifacts: TrainArtifacts,
+    global_feature_cols: list[str],
+) -> np.ndarray:
+    out = feat_df.copy()
+    out["global_pred_feature"] = artifacts.global_model.predict(out[global_feature_cols])
+
+    pred = np.full(len(out), np.nan, dtype=float)
+    key = out[["market"]].copy()
+    for market, idx in key.groupby("market", dropna=False).groups.items():
+        model = artifacts.local_models.get(str(market))
+        if model is None:
+            pred[idx] = out.loc[idx, "global_pred_feature"].to_numpy(dtype=float)
+            continue
+
+        local_pred = model.predict(out.loc[idx, artifacts.feature_cols])
+        if artifacts.local_target_is_residual:
+            pred[idx] = out.loc[idx, "global_pred_feature"].to_numpy(dtype=float) + local_pred
+        else:
+            pred[idx] = local_pred
+    if np.isnan(pred).any():
+        raise ValueError("NaNs found in global/local inference pipeline.")
+    return pred
+
+
+def _permute_columns_with_index(
+    feat_df: pd.DataFrame,
+    columns: list[str],
+    perm_idx: np.ndarray,
+) -> pd.DataFrame:
+    out = feat_df.copy()
+    for col in columns:
+        out[col] = out[col].to_numpy()[perm_idx]
+    return out
+
+
+def _build_correlation_groups(
+    train_feat: pd.DataFrame,
+    *,
+    feature_cols: list[str],
+    cat_cols: list[str],
+    corr_threshold: float,
+) -> tuple[list[tuple[str, list[str]]], list[dict[str, object]]]:
+    numeric_cols = [
+        c
+        for c in feature_cols
+        if c not in cat_cols and pd.api.types.is_numeric_dtype(train_feat[c])
+    ]
+    if not numeric_cols:
+        return [], []
+
+    corr = train_feat[numeric_cols].corr(method="pearson").abs().fillna(0.0)
+    visited: set[str] = set()
+    groups: list[tuple[str, list[str]]] = []
+    corr_group_rows: list[dict[str, object]] = []
+
+    for feature in numeric_cols:
+        if feature in visited:
+            continue
+        stack = [feature]
+        component: list[str] = []
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            component.append(cur)
+            neighbors = corr.columns[(corr.loc[cur] >= corr_threshold) & (corr.columns != cur)].tolist()
+            for nxt in neighbors:
+                if nxt not in visited:
+                    stack.append(nxt)
+
+        component_sorted = sorted(component)
+        key = "|".join(component_sorted)
+        group_id = f"corr_{_stable_hash_int(key) % 10_000_000_000:010d}"
+        groups.append((group_id, component_sorted))
+
+        group_size = int(len(component_sorted))
+        for col in component_sorted:
+            corr_group_rows.append(
+                {
+                    "group_id": group_id,
+                    "feature": col,
+                    "group_size": group_size,
+                    "corr_threshold": float(corr_threshold),
+                }
+            )
+    return groups, corr_group_rows
+
+
+def _feature_family_map(feature_cols: list[str]) -> dict[str, list[str]]:
+    patterns = {
+        "lags": re.compile(r"_lag_|_diff_|_roll_", flags=re.IGNORECASE),
+        "xmk": re.compile(r"_xmk_", flags=re.IGNORECASE),
+        "ratios_shares": re.compile(r"ratio|share", flags=re.IGNORECASE),
+        "meteo": re.compile(
+            r"wind|solar|irradiance|cloud|temperature|dew|precip|snow|pressure|humidity|cape|convective|gust|apparent",
+            flags=re.IGNORECASE,
+        ),
+        "profiles": re.compile(r"target_profile_", flags=re.IGNORECASE),
+    }
+    out: dict[str, list[str]] = {}
+    for family_name, pattern in patterns.items():
+        out[family_name] = [c for c in feature_cols if pattern.search(c)]
+    return out
+
+
+# Interpretation guide for saved deltas:
+# - Positive mean_delta: robust OOS signal.
+# - Negative mean_delta: likely noise-fit/overfit behavior.
+# - Large std_delta: unstable effect across folds.
+# - Single-feature delta near 0 but group delta > 0: correlation masking/redundancy.
+# - Group delta < 0: the correlated information cluster is harmful out-of-sample.
+def _summarize_single_feature_importance(perm_rows: pd.DataFrame) -> pd.DataFrame:
+    out_cols = [
+        "feature",
+        "mean_delta",
+        "median_delta",
+        "std_delta",
+        "positive_fold_count",
+        "n_folds",
+    ]
+    if perm_rows.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    grouped = perm_rows.groupby("feature", dropna=False)
+    out = grouped["delta"].agg(["mean", "median", "std", "count"]).reset_index()
+    out = out.rename(
+        columns={
+            "mean": "mean_delta",
+            "median": "median_delta",
+            "std": "std_delta",
+            "count": "n_folds",
+        }
+    )
+    out["positive_fold_count"] = grouped["delta"].apply(lambda s: int((s > 0).sum())).to_numpy()
+    out["std_delta"] = out["std_delta"].fillna(0.0)
+    out["positive_fold_count"] = out["positive_fold_count"].astype(int)
+    out["n_folds"] = out["n_folds"].astype(int)
+    return out[out_cols].sort_values("mean_delta", ascending=False).reset_index(drop=True)
+
+
+def _summarize_group_importance(perm_group_rows: pd.DataFrame) -> pd.DataFrame:
+    out_cols = [
+        "group_id",
+        "group_size",
+        "mean_delta",
+        "median_delta",
+        "std_delta",
+        "positive_fold_count",
+    ]
+    if perm_group_rows.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    grouped = perm_group_rows.groupby("group_id", dropna=False)
+    out = grouped.agg(
+        group_size=("group_size", "max"),
+        mean_delta=("delta", "mean"),
+        median_delta=("delta", "median"),
+        std_delta=("delta", "std"),
+        positive_fold_count=("delta", lambda s: int((s > 0).sum())),
+    ).reset_index()
+    out["std_delta"] = out["std_delta"].fillna(0.0)
+    out["group_size"] = out["group_size"].astype(int)
+    out["positive_fold_count"] = out["positive_fold_count"].astype(int)
+    return out[out_cols].sort_values("mean_delta", ascending=False).reset_index(drop=True)
+
+
+def _summarize_family_importance(perm_family_rows: pd.DataFrame) -> pd.DataFrame:
+    out_cols = [
+        "family_name",
+        "mean_delta",
+        "median_delta",
+        "std_delta",
+        "positive_fold_count",
+        "n_folds",
+    ]
+    if perm_family_rows.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    grouped = perm_family_rows.groupby("family_name", dropna=False)
+    out = grouped["delta"].agg(["mean", "median", "std", "count"]).reset_index()
+    out = out.rename(
+        columns={
+            "mean": "mean_delta",
+            "median": "median_delta",
+            "std": "std_delta",
+            "count": "n_folds",
+        }
+    )
+    out["positive_fold_count"] = grouped["delta"].apply(lambda s: int((s > 0).sum())).to_numpy()
+    out["std_delta"] = out["std_delta"].fillna(0.0)
+    out["positive_fold_count"] = out["positive_fold_count"].astype(int)
+    out["n_folds"] = out["n_folds"].astype(int)
+    return out[out_cols].sort_values("mean_delta", ascending=False).reset_index(drop=True)
 
 
 def _make_global_model() -> CatBoostRegressor:
@@ -379,6 +705,44 @@ def maybe_drop_redundant_features(
     drop_set = set(REDUNDANT_FEATURE_DROP_LIST)
     kept = [c for c in feature_cols if c not in drop_set]
     dropped = [c for c in feature_cols if c in drop_set]
+    return kept, dropped
+
+
+def apply_permutation_pruned_feature_policy(
+    feature_cols: list[str],
+    *,
+    enabled: bool,
+) -> tuple[list[str], list[str]]:
+    if not enabled:
+        return feature_cols, []
+
+    kept: list[str] = []
+    dropped: list[str] = []
+
+    for col in feature_cols:
+        if col.startswith("target_profile_"):
+            dropped.append(col)
+            continue
+        if "_xmk_" in col:
+            dropped.append(col)
+            continue
+
+        is_short_lag = re.search(r"_lag_(1|2|6)$", col) is not None
+        is_roll_mean_6_24 = re.search(r"_roll_mean_(6|24)$", col) is not None
+        should_keep = (
+            col in CORE_FORECAST_FEATURES
+            or is_short_lag
+            or is_roll_mean_6_24
+            or col in KEY_METEO_FEATURES
+            or col in ROBUST_POSITIVE_FEATURES
+        )
+        if should_keep:
+            kept.append(col)
+        else:
+            dropped.append(col)
+
+    if not kept:
+        raise ValueError("Permutation-pruned feature policy removed all features.")
     return kept, dropped
 
 
@@ -643,6 +1007,45 @@ def save_repro_artifacts(
     print(f"Saved model metadata: {run_dir / 'model_metadata.json'}")
 
 
+def save_permutation_eval_outputs(run_dir: Path, outputs: PermutationEvalOutputs) -> None:
+    outputs.perm_importance_by_fold.to_csv(run_dir / "perm_importance_by_fold.csv", index=False)
+    outputs.perm_importance_summary.to_csv(run_dir / "perm_importance_summary.csv", index=False)
+    outputs.corr_groups.to_csv(run_dir / "corr_groups.csv", index=False)
+    outputs.perm_importance_groups_by_fold.to_csv(
+        run_dir / "perm_importance_groups_by_fold.csv",
+        index=False,
+    )
+    outputs.perm_importance_groups_summary.to_csv(
+        run_dir / "perm_importance_groups_summary.csv",
+        index=False,
+    )
+    outputs.perm_importance_families.to_csv(run_dir / "perm_importance_families.csv", index=False)
+    outputs.perm_importance_families_summary.to_csv(
+        run_dir / "perm_importance_families_summary.csv",
+        index=False,
+    )
+
+    meta = {
+        "runtime_seconds": float(outputs.runtime_seconds),
+        "n_features_evaluated": int(outputs.n_features_evaluated),
+        "n_groups_evaluated": int(outputs.n_groups_evaluated),
+        "n_family_evaluations": int(outputs.n_family_evaluations),
+    }
+    (run_dir / "perm_importance_metadata.json").write_text(
+        json.dumps(meta, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print("Saved permutation OOS importance reports:")
+    print(f"- {run_dir / 'perm_importance_by_fold.csv'}")
+    print(f"- {run_dir / 'perm_importance_summary.csv'}")
+    print(f"- {run_dir / 'corr_groups.csv'}")
+    print(f"- {run_dir / 'perm_importance_groups_by_fold.csv'}")
+    print(f"- {run_dir / 'perm_importance_groups_summary.csv'}")
+    print(f"- {run_dir / 'perm_importance_families.csv'}")
+    print(f"- {run_dir / 'perm_importance_families_summary.csv'}")
+    print(f"- {run_dir / 'perm_importance_metadata.json'}")
+
+
 def make_time_series_folds(
     train_df: pd.DataFrame,
     n_folds: int,
@@ -720,7 +1123,13 @@ def run_time_series_cv(
     add_temperature_demand: bool,
     add_physics_regime: bool,
     drop_redundant_features: bool,
-) -> tuple[float | None, pd.DataFrame, pd.DataFrame]:
+    use_permutation_pruned_feature_set: bool,
+    permutation_eval_enabled: bool,
+    permutation_eval_base_seed: int,
+    permutation_corr_threshold: float,
+    permutation_eval_families: bool,
+    on_fold_complete: Callable[[int, int], None] | None = None,
+) -> tuple[float | None, pd.DataFrame, pd.DataFrame, PermutationEvalOutputs | None]:
     folds = make_time_series_folds(
         train_df=train_df_raw,
         n_folds=n_folds,
@@ -730,12 +1139,20 @@ def run_time_series_cv(
     )
     if not folds:
         print("CV skipped: not enough history for requested folds.")
-        return None, pd.DataFrame(), pd.DataFrame()
+        return None, pd.DataFrame(), pd.DataFrame(), None
 
     start_all = _to_datetime_col(train_df_raw, "delivery_start")
     fold_rows: list[dict[str, object]] = []
     oof_rows: list[pd.DataFrame] = []
     oof = pd.Series(index=train_df_raw.index, dtype=float)
+    perm_feature_rows: list[dict[str, object]] = []
+    perm_group_rows: list[dict[str, object]] = []
+    perm_family_rows: list[dict[str, object]] = []
+    corr_group_rows_all: list[dict[str, object]] = []
+    perm_runtime_total = 0.0
+    n_features_evaluated = 0
+    n_groups_evaluated = 0
+    n_family_evaluations = 0
 
     print(
         f"CV start: folds={len(folds)}, val_days={val_days}, step_days={step_days}, "
@@ -748,6 +1165,8 @@ def run_time_series_cv(
         va = train_df_raw.loc[va_mask].copy()
         if tr.empty or va.empty:
             print(f"CV fold {fold_idx}: skipped (empty train/val)")
+            if on_fold_complete is not None:
+                on_fold_complete(fold_idx, len(folds))
             continue
 
         print(
@@ -771,6 +1190,15 @@ def run_time_series_cv(
         )
         if dropped_cols:
             print(f"CV fold {fold_idx}: dropped {len(dropped_cols)} redundant features")
+        feat_cols, dropped_policy = apply_permutation_pruned_feature_policy(
+            feat_cols,
+            enabled=use_permutation_pruned_feature_set,
+        )
+        if dropped_policy:
+            print(
+                f"CV fold {fold_idx}: permutation-pruned feature policy active | "
+                f"kept={len(feat_cols)} dropped={len(dropped_policy)}"
+            )
         cat_cols = [
             c
             for c in ["market", "hour_x_market", "dow_x_market", "month_x_market"]
@@ -787,25 +1215,13 @@ def run_time_series_cv(
             residual_oof_step_days=residual_oof_step_days,
             residual_oof_min_train_days=residual_oof_min_train_days,
         )
-        va_feat = va_feat.copy()
-        va_feat["global_pred_feature"] = artifacts.global_model.predict(va_feat[feat_cols])
-
-        pred = np.full(len(va_feat), np.nan, dtype=float)
-        key = va_feat[["market"]].copy()
-        for market, idx in key.groupby("market", dropna=False).groups.items():
-            model = artifacts.local_models.get(str(market))
-            if model is None:
-                pred[idx] = va_feat.loc[idx, "global_pred_feature"].to_numpy(dtype=float)
-            else:
-                local_pred = model.predict(va_feat.loc[idx, artifacts.feature_cols])
-                if artifacts.local_target_is_residual:
-                    pred[idx] = va_feat.loc[idx, "global_pred_feature"].to_numpy(dtype=float) + local_pred
-                else:
-                    pred[idx] = local_pred
-        if np.isnan(pred).any():
-            raise ValueError(f"NaNs in CV predictions for fold {fold_idx}")
-
-        fold_rmse = _rmse(va["target"].to_numpy(dtype=float), pred)
+        pred = _predict_with_global_local_pipeline(
+            va_feat,
+            artifacts=artifacts,
+            global_feature_cols=feat_cols,
+        )
+        y_val = va["target"].to_numpy(dtype=float)
+        fold_rmse = _rmse(y_val, pred)
         print(f"CV fold {fold_idx} RMSE={fold_rmse:.6f}")
         fold_rows.append(
             {
@@ -841,7 +1257,139 @@ def run_time_series_cv(
                 }
             )
         )
+
+        if permutation_eval_enabled:
+            fold_eval_start = time.perf_counter()
+            baseline_rmse = _rmse(y_val, pred)
+            if abs(baseline_rmse - fold_rmse) > 1e-9:
+                raise ValueError(
+                    f"Baseline RMSE mismatch in fold {fold_idx}: baseline={baseline_rmse}, fold={fold_rmse}"
+                )
+            n_val_rows = len(va_feat)
+            if n_val_rows == 0:
+                raise ValueError(f"Cannot run permutation eval for fold {fold_idx} with empty validation set.")
+
+            feature_progress = LoopProgress(
+                label=f"Fold {fold_idx} feature permutations",
+                total=len(feat_cols),
+            )
+            for feature_i, feature in enumerate(feat_cols, start=1):
+                seed = _permutation_seed(
+                    permutation_eval_base_seed,
+                    fold_idx,
+                    f"feature::{feature}",
+                )
+                perm_idx = np.random.default_rng(seed).permutation(n_val_rows)
+                va_perm = _permute_columns_with_index(va_feat, [feature], perm_idx)
+                perm_pred = _predict_with_global_local_pipeline(
+                    va_perm,
+                    artifacts=artifacts,
+                    global_feature_cols=feat_cols,
+                )
+                rmse_permuted = _rmse(y_val, perm_pred)
+                # Positive delta means robust OOS signal; negative delta suggests noisy/overfit behavior.
+                delta = rmse_permuted - baseline_rmse
+                perm_feature_rows.append(
+                    {
+                        "fold": fold_idx,
+                        "feature": feature,
+                        "baseline_rmse": baseline_rmse,
+                        "rmse_permuted": rmse_permuted,
+                        "delta": delta,
+                        "n_val_rows": n_val_rows,
+                    }
+                )
+                feature_progress.update(feature_i)
+            feature_progress.finish()
+            n_features_evaluated += len(feat_cols)
+
+            corr_groups, corr_rows = _build_correlation_groups(
+                tr_feat,
+                feature_cols=feat_cols,
+                cat_cols=cat_cols,
+                corr_threshold=permutation_corr_threshold,
+            )
+            corr_group_rows_all.extend(corr_rows)
+            group_progress = LoopProgress(
+                label=f"Fold {fold_idx} correlation-group permutations",
+                total=len(corr_groups),
+            )
+            for group_i, (group_id, group_features) in enumerate(corr_groups, start=1):
+                seed = _permutation_seed(
+                    permutation_eval_base_seed,
+                    fold_idx,
+                    f"group::{group_id}",
+                )
+                perm_idx = np.random.default_rng(seed).permutation(n_val_rows)
+                va_perm = _permute_columns_with_index(va_feat, group_features, perm_idx)
+                perm_pred = _predict_with_global_local_pipeline(
+                    va_perm,
+                    artifacts=artifacts,
+                    global_feature_cols=feat_cols,
+                )
+                rmse_permuted = _rmse(y_val, perm_pred)
+                delta = rmse_permuted - baseline_rmse
+                perm_group_rows.append(
+                    {
+                        "fold": fold_idx,
+                        "group_id": group_id,
+                        "group_size": int(len(group_features)),
+                        "baseline_rmse": baseline_rmse,
+                        "rmse_permuted": rmse_permuted,
+                        "delta": delta,
+                    }
+                )
+                group_progress.update(group_i)
+            group_progress.finish()
+            n_groups_evaluated += len(corr_groups)
+
+            families_evaluated_in_fold = 0
+            if permutation_eval_families:
+                family_map = _feature_family_map(feat_cols)
+                family_items = [(k, v) for k, v in family_map.items() if v]
+                family_progress = LoopProgress(
+                    label=f"Fold {fold_idx} family permutations",
+                    total=len(family_items),
+                )
+                for family_i, (family_name, family_features) in enumerate(family_items, start=1):
+                    seed = _permutation_seed(
+                        permutation_eval_base_seed,
+                        fold_idx,
+                        f"family::{family_name}",
+                    )
+                    perm_idx = np.random.default_rng(seed).permutation(n_val_rows)
+                    va_perm = _permute_columns_with_index(va_feat, family_features, perm_idx)
+                    perm_pred = _predict_with_global_local_pipeline(
+                        va_perm,
+                        artifacts=artifacts,
+                        global_feature_cols=feat_cols,
+                    )
+                    rmse_permuted = _rmse(y_val, perm_pred)
+                    delta = rmse_permuted - baseline_rmse
+                    perm_family_rows.append(
+                        {
+                            "fold": fold_idx,
+                            "family_name": family_name,
+                            "baseline_rmse": baseline_rmse,
+                            "rmse_permuted": rmse_permuted,
+                            "delta": delta,
+                        }
+                    )
+                    families_evaluated_in_fold += 1
+                    family_progress.update(family_i)
+                family_progress.finish()
+            n_family_evaluations += families_evaluated_in_fold
+
+            fold_eval_runtime = time.perf_counter() - fold_eval_start
+            perm_runtime_total += fold_eval_runtime
+            print(
+                f"CV fold {fold_idx}: permutation OOS eval complete | "
+                f"features={len(feat_cols)} groups={len(corr_groups)} "
+                f"families={families_evaluated_in_fold} runtime={fold_eval_runtime:.2f}s"
+            )
         oof.loc[va.index] = pred
+        if on_fold_complete is not None:
+            on_fold_complete(fold_idx, len(folds))
 
     coverage = float(oof.notna().mean())
     overall = None
@@ -854,7 +1402,84 @@ def run_time_series_cv(
     print(f"CV OOF coverage: {coverage:.4%}")
     print(f"CV OOF RMSE: {overall if overall is not None else 'None'}")
     cv_oof = pd.concat(oof_rows, ignore_index=True) if oof_rows else pd.DataFrame()
-    return overall, pd.DataFrame(fold_rows), cv_oof
+    permutation_outputs = None
+    if permutation_eval_enabled:
+        feature_cols_out = [
+            "fold",
+            "feature",
+            "baseline_rmse",
+            "rmse_permuted",
+            "delta",
+            "n_val_rows",
+        ]
+        group_cols_out = [
+            "fold",
+            "group_id",
+            "group_size",
+            "baseline_rmse",
+            "rmse_permuted",
+            "delta",
+        ]
+        family_cols_out = [
+            "fold",
+            "family_name",
+            "baseline_rmse",
+            "rmse_permuted",
+            "delta",
+        ]
+        corr_group_cols_out = ["group_id", "feature", "group_size", "corr_threshold"]
+
+        perm_importance_by_fold = (
+            pd.DataFrame(perm_feature_rows, columns=feature_cols_out)
+            .sort_values(["fold", "feature"])
+            .reset_index(drop=True)
+            if perm_feature_rows
+            else pd.DataFrame(columns=feature_cols_out)
+        )
+        corr_groups = (
+            pd.DataFrame(corr_group_rows_all, columns=corr_group_cols_out)
+            .drop_duplicates()
+            .sort_values(["group_id", "feature"])
+            .reset_index(drop=True)
+            if corr_group_rows_all
+            else pd.DataFrame(columns=corr_group_cols_out)
+        )
+        perm_importance_groups_by_fold = (
+            pd.DataFrame(perm_group_rows, columns=group_cols_out)
+            .sort_values(["fold", "group_id"])
+            .reset_index(drop=True)
+            if perm_group_rows
+            else pd.DataFrame(columns=group_cols_out)
+        )
+        perm_importance_families = (
+            pd.DataFrame(perm_family_rows, columns=family_cols_out)
+            .sort_values(["fold", "family_name"])
+            .reset_index(drop=True)
+            if perm_family_rows
+            else pd.DataFrame(columns=family_cols_out)
+        )
+
+        permutation_outputs = PermutationEvalOutputs(
+            perm_importance_by_fold=perm_importance_by_fold,
+            perm_importance_summary=_summarize_single_feature_importance(perm_importance_by_fold),
+            corr_groups=corr_groups,
+            perm_importance_groups_by_fold=perm_importance_groups_by_fold,
+            perm_importance_groups_summary=_summarize_group_importance(perm_importance_groups_by_fold),
+            perm_importance_families=perm_importance_families,
+            perm_importance_families_summary=_summarize_family_importance(perm_importance_families),
+            runtime_seconds=perm_runtime_total,
+            n_features_evaluated=n_features_evaluated,
+            n_groups_evaluated=n_groups_evaluated,
+            n_family_evaluations=n_family_evaluations,
+        )
+        print(
+            "Permutation OOS eval totals: "
+            f"features={n_features_evaluated}, "
+            f"groups={n_groups_evaluated}, "
+            f"family_evaluations={n_family_evaluations}, "
+            f"runtime={perm_runtime_total:.2f}s"
+        )
+    return overall, pd.DataFrame(fold_rows), cv_oof, permutation_outputs
 
 
 def train_global_and_local_models(
@@ -973,11 +1598,45 @@ def main() -> None:
         default=False,
         help="Drop conservative duplicate/constant feature set (default: disabled).",
     )
+    parser.add_argument(
+        "--use-permutation-pruned-feature-set",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Apply strict permutation-guided feature policy: drop full profiles/xmk families, "
+            "then keep only core forecasts, short lags (<=6), roll_mean_{6,24}, "
+            "wind_speed_80m + key meteo, and curated robust positives (default: disabled)."
+        ),
+    )
     parser.add_argument("--cv", action="store_true")
     parser.add_argument("--cv-folds", type=int, default=5)
     parser.add_argument("--cv-val-days", type=int, default=14)
     parser.add_argument("--cv-step-days", type=int, default=14)
     parser.add_argument("--cv-min-train-days", type=int, default=90)
+    parser.add_argument(
+        "--save-permutation-eval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run OOS permutation importance during CV and save CSV reports (default: enabled).",
+    )
+    parser.add_argument(
+        "--perm-base-seed",
+        type=int,
+        default=42,
+        help="Base seed used for deterministic fold-aware permutations (default: 42).",
+    )
+    parser.add_argument(
+        "--perm-corr-threshold",
+        type=float,
+        default=0.95,
+        help="Absolute Pearson threshold for correlation-group components (default: 0.95).",
+    )
+    parser.add_argument(
+        "--perm-eval-families",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evaluate predefined feature-family group permutations (default: enabled).",
+    )
     parser.add_argument(
         "--use-residual-stacking",
         action=argparse.BooleanOptionalAction,
@@ -1045,6 +1704,8 @@ def main() -> None:
         help="Sampling seed for SHAP exports (default: 42).",
     )
     args = parser.parse_args()
+    if not (0.0 <= args.perm_corr_threshold <= 1.0):
+        raise ValueError("--perm-corr-threshold must be between 0 and 1.")
 
     train_df = pd.read_csv(args.train_path)
     test_df = pd.read_csv(args.test_path)
@@ -1055,11 +1716,48 @@ def main() -> None:
     if args.train_start_oct_2023:
         train_df = apply_train_start_cutoff(train_df, start_date="2023-10-01")
 
+    cv_fold_count = 0
+    if args.cv:
+        cv_fold_count = len(
+            make_time_series_folds(
+                train_df=train_df,
+                n_folds=args.cv_folds,
+                val_days=args.cv_val_days,
+                step_days=args.cv_step_days,
+                min_train_days=args.cv_min_train_days,
+            )
+        )
+    overall_total_steps = (
+        4  # data prepared + main feature table + main training + submission write
+        + cv_fold_count
+        + int(args.save_models)
+        + int(args.save_repro_artifacts)
+        + int(args.save_shap)
+    )
+    overall_progress = LoopProgress(
+        label="Overall process",
+        total=overall_total_steps,
+        min_interval_seconds=0.0,
+    )
+    overall_done = 0
+
+    def _overall_tick(step_name: str) -> None:
+        nonlocal overall_done
+        overall_done += 1
+        print(f"Overall step complete: {step_name}")
+        overall_progress.update(overall_done, force=True)
+
+    _overall_tick("data loaded and filters applied")
+
     cv_rmse = None
     cv_details = pd.DataFrame()
     cv_oof = pd.DataFrame()
+    cv_permutation_outputs: PermutationEvalOutputs | None = None
     if args.cv:
-        cv_rmse, cv_details, cv_oof = run_time_series_cv(
+        def _on_cv_fold_complete(fold_index: int, fold_total: int) -> None:
+            _overall_tick(f"cv fold {fold_index}/{fold_total}")
+
+        cv_rmse, cv_details, cv_oof, cv_permutation_outputs = run_time_series_cv(
             train_df_raw=train_df,
             n_folds=args.cv_folds,
             val_days=args.cv_val_days,
@@ -1073,6 +1771,12 @@ def main() -> None:
             add_temperature_demand=args.add_temperature_demand_features,
             add_physics_regime=args.add_physics_regime_features,
             drop_redundant_features=args.drop_redundant_features,
+            use_permutation_pruned_feature_set=args.use_permutation_pruned_feature_set,
+            permutation_eval_enabled=args.save_permutation_eval,
+            permutation_eval_base_seed=args.perm_base_seed,
+            permutation_corr_threshold=args.perm_corr_threshold,
+            permutation_eval_families=args.perm_eval_families,
+            on_fold_complete=_on_cv_fold_complete,
         )
 
     train_feat, test_feat = build_feature_table(
@@ -1081,6 +1785,7 @@ def main() -> None:
         add_temperature_demand=args.add_temperature_demand_features,
         add_physics_regime=args.add_physics_regime_features,
     )
+    _overall_tick("main feature table built")
     test_with_key = test_feat[["id", "market"]].copy()
 
     base_drop = {"id", "target", "delivery_start", "delivery_end"}
@@ -1092,6 +1797,15 @@ def main() -> None:
     if dropped_cols_main:
         print(f"Dropped {len(dropped_cols_main)} redundant features in main fit path.")
         print(f"Dropped features: {sorted(dropped_cols_main)}")
+    candidate_features, dropped_policy_main = apply_permutation_pruned_feature_policy(
+        candidate_features,
+        enabled=args.use_permutation_pruned_feature_set,
+    )
+    if dropped_policy_main:
+        print(
+            "Permutation-pruned feature policy active in main fit path: "
+            f"kept={len(candidate_features)} dropped={len(dropped_policy_main)}"
+        )
     cat_cols = [
         c
         for c in ["market", "hour_x_market", "dow_x_market", "month_x_market"]
@@ -1108,6 +1822,7 @@ def main() -> None:
         residual_oof_step_days=args.residual_oof_step_days,
         residual_oof_min_train_days=args.residual_oof_min_train_days,
     )
+    _overall_tick("main global/local models trained")
 
     # Add global prediction feature to test and run local market experts.
     test_feat = test_feat.copy()
@@ -1144,6 +1859,7 @@ def main() -> None:
     latest_path = Path("csv/submission_per_market_interactions.csv")
     latest_path.parent.mkdir(parents=True, exist_ok=True)
     out_sub.to_csv(latest_path, index=False)
+    _overall_tick("submission generated and saved")
 
     print(f"Saved submission: {sub_path}")
     print(f"Saved latest copy: {latest_path}")
@@ -1177,6 +1893,8 @@ def main() -> None:
         cv_market_path = run_dir / "cv_market_results.csv"
         cv_market.to_csv(cv_market_path, index=False)
         print(f"Saved CV market details: {cv_market_path}")
+    if cv_permutation_outputs is not None:
+        save_permutation_eval_outputs(run_dir=run_dir, outputs=cv_permutation_outputs)
     model_file_map: dict[str, Any] = {"global_model": None, "local_models": {}}
     if args.save_models:
         models_dir = run_dir / "models"
@@ -1194,6 +1912,7 @@ def main() -> None:
             local_model_paths[str(market)] = str(local_path.name)
         model_file_map["local_models"] = local_model_paths
         print(f"Saved models dir: {models_dir}")
+        _overall_tick("models saved")
 
     if args.save_repro_artifacts:
         save_repro_artifacts(
@@ -1206,6 +1925,7 @@ def main() -> None:
             artifacts=artifacts,
             model_file_map=model_file_map,
         )
+        _overall_tick("repro artifacts saved")
 
     if args.save_shap:
         save_shap_outputs(
@@ -1217,6 +1937,7 @@ def main() -> None:
             per_market_sample_size=args.shap_per_market_sample_size,
             seed=args.shap_seed,
         )
+        _overall_tick("shap outputs saved")
 
 
 if __name__ == "__main__":

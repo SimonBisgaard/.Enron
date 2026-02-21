@@ -1,0 +1,53 @@
+{
+  "default": {
+    "train_start": "2024-01-01",
+    "blend_weights": [0.5, 0.5],
+    "model_a": {
+      "iterations": 3000,
+      "learning_rate": 0.025,
+      "depth": 8,
+      "l2_leaf_reg": 20.0,
+      "bagging_temperature": 0.4,
+      "random_strength": 0.9
+    },
+    "model_b": {
+      "iterations": 2200,
+      "learning_rate": 0.03,
+      "depth": 6,
+      "l2_leaf_reg": 28.0,
+      "bagging_temperature": 0.7,
+      "random_strength": 1.15
+    }
+  },
+  "markets": {
+    "Market A": {
+      "train_start": "2024-03-01",
+      "blend_weights": [0.6, 0.4],
+      "cap": {
+        "lower_q": 0.01,
+        "upper_q": 0.995,
+        "min_rows": 24
+      }
+    },
+    "Market B": {
+      "blend_weights": [0.7, 0.3],
+      "model_b": {
+        "depth": 5,
+        "l2_leaf_reg": 32.0
+      },
+      "cap": {
+        "lower_q": 0.01,
+        "upper_q": 0.99,
+        "min_rows": 30
+      }
+    },
+    "Market C": {
+      "blend_weights": [0.65, 0.35],
+      "cap": {
+        "lower_q": 0.005,
+        "upper_q": 0.99,
+        "min_rows": 30
+      }
+    }
+  }
+}

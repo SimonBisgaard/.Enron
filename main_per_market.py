@@ -1222,7 +1222,8 @@ def run_with_ledger(
     oof_path = run_dir / "oof.csv"
     submission_path = run_dir / "submission.csv"
     model_manifest_path = run_dir / "models_manifest.txt"
-    registry_path = base_dir / "experiments.csv"
+    registry_path = base_dir / "csv" / "experiments.csv"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
 
     config = _build_default_config(safe_config_name)
     config["fast_dev"] = bool(fast_dev)
@@ -1880,7 +1881,8 @@ def run_with_ledger(
             }
             _append_experiment_registry(registry_path, registry_row)
 
-            latest_submission_path = base_dir / "submission_per_market.csv"
+            latest_submission_path = base_dir / "csv" / "submission_per_market.csv"
+            latest_submission_path.parent.mkdir(parents=True, exist_ok=True)
             submission.to_csv(latest_submission_path, index=False)
 
             print(f"Saved run artifacts under: {run_dir}")

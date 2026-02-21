@@ -73,7 +73,7 @@ def main() -> None:
         ),
     )
     parser.add_argument("--runs-dir", default="runs", help="Runs directory used for token lookup.")
-    parser.add_argument("--output", default="submission_average.csv", help="Output CSV path.")
+    parser.add_argument("--output", default="csv/submission_average.csv", help="Output CSV path.")
     args = parser.parse_args()
 
     runs_dir = Path(args.runs_dir)
@@ -87,6 +87,7 @@ def main() -> None:
 
     avg = average_submissions(resolved_sources)
     out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     avg.to_csv(out_path, index=False)
     print(f"Saved averaged submission: {out_path}")
     print(f"Rows: {len(avg)}")

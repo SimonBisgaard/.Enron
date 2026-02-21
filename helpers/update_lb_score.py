@@ -43,13 +43,13 @@ def update_lb_score(registry_path: Path, run_id: str, lb_score: float) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Update leaderboard score for an existing run in experiments.csv")
+    parser = argparse.ArgumentParser(description="Update leaderboard score for an existing run in csv/experiments.csv")
     parser.add_argument("--run-id", required=True, help="Run ID to update")
     parser.add_argument("--lb-score", required=True, type=float, help="Leaderboard score value")
     parser.add_argument(
         "--registry",
-        default="experiments.csv",
-        help="Path to experiments registry CSV (default: experiments.csv)",
+        default="csv/experiments.csv",
+        help="Path to experiments registry CSV (default: csv/experiments.csv)",
     )
     args = parser.parse_args()
 

@@ -26,10 +26,10 @@ def main() -> None:
             "N * std(target_pred) per (market,hour,dow) on rows with missing meteo."
         )
     )
-    parser.add_argument("--baseline-submission", default="submissio.csv")
+    parser.add_argument("--baseline-submission", default="csv/submissio.csv")
     parser.add_argument("--test-path", default="data/test_for_participants.csv")
     parser.add_argument("--std-multiplier", type=float, default=2.0)
-    parser.add_argument("--out-path", default="submission_missing_plus2std.csv")
+    parser.add_argument("--out-path", default="csv/submission_missing_plus2std.csv")
     args = parser.parse_args()
 
     baseline_path = Path(args.baseline_submission)
@@ -111,6 +111,7 @@ def main() -> None:
     )
 
     out = out.sort_values("id")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(out_path, index=False)
 
     n_missing = int(merged["meteo_missing_any"].sum())

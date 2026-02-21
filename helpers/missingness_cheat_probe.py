@@ -88,7 +88,7 @@ def main() -> None:
     parser.add_argument("--sample-submission", default="data/sample_submission.csv")
     parser.add_argument(
         "--baseline-submission",
-        default="submissio.csv",
+        default="csv/submissio.csv",
         help="Existing baseline submission to impute into on missing-weather rows.",
     )
     parser.add_argument("--out-dir", default="runs")

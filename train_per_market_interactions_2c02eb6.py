@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import platform
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
-from catboost import CatBoostRegressor
+from catboost import CatBoostRegressor, Pool
 from sklearn.metrics import mean_squared_error
 
 
@@ -239,6 +245,266 @@ def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 
+def _yaml_scalar(v: Any) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if v is None:
+        return "null"
+    if isinstance(v, (int, np.integer)):
+        return str(int(v))
+    if isinstance(v, (float, np.floating)):
+        x = float(v)
+        if not np.isfinite(x):
+            return "null"
+        return format(x, ".15g")
+    s = str(v)
+    if s == "" or any(ch in s for ch in [":", "#", "{", "}", "[", "]", ",", "\n", "\"", "'"]) or s.strip() != s:
+        return json.dumps(s)
+    return s
+
+
+def _yaml_lines(value: Any, indent: int = 0) -> list[str]:
+    sp = "  " * indent
+    if isinstance(value, dict):
+        if not value:
+            return [f"{sp}{{}}"]
+        lines: list[str] = []
+        for k, v in value.items():
+            key = str(k)
+            if isinstance(v, (dict, list)):
+                lines.append(f"{sp}{key}:")
+                lines.extend(_yaml_lines(v, indent + 1))
+            else:
+                lines.append(f"{sp}{key}: {_yaml_scalar(v)}")
+        return lines
+    if isinstance(value, list):
+        if not value:
+            return [f"{sp}[]"]
+        lines = []
+        for item in value:
+            if isinstance(item, (dict, list)):
+                lines.append(f"{sp}-")
+                lines.extend(_yaml_lines(item, indent + 1))
+            else:
+                lines.append(f"{sp}- {_yaml_scalar(item)}")
+        return lines
+    return [f"{sp}{_yaml_scalar(value)}"]
+
+
+def _write_yaml(path: Path, data: dict[str, Any]) -> None:
+    path.write_text("\n".join(_yaml_lines(data)) + "\n", encoding="utf-8")
+
+
+def _sha256_file(path: Path) -> str | None:
+    if not path.exists() or not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _run_cmd(args: list[str]) -> str | None:
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, check=True)
+        return p.stdout.strip()
+    except Exception:
+        return None
+
+
+def _cat_indices(feature_cols: list[str], cat_cols: list[str]) -> list[int]:
+    cset = set(cat_cols)
+    return [i for i, c in enumerate(feature_cols) if c in cset]
+
+
+def _sample_df(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
+    if len(df) <= n:
+        return df.copy()
+    return df.sample(n=n, random_state=seed).copy()
+
+
+def save_shap_outputs(
+    run_dir: Path,
+    train_feat: pd.DataFrame,
+    artifacts: TrainArtifacts,
+    global_feature_cols: list[str],
+    *,
+    global_sample_size: int,
+    per_market_sample_size: int,
+    seed: int,
+) -> None:
+    global_sample = _sample_df(train_feat, global_sample_size, seed)
+    global_pool = Pool(
+        data=global_sample[global_feature_cols],
+        cat_features=_cat_indices(global_feature_cols, artifacts.cat_cols),
+    )
+    shap_global = artifacts.global_model.get_feature_importance(global_pool, type="ShapValues")
+    shap_global_vals = shap_global[:, :-1]
+    shap_global_base = shap_global[:, -1]
+    global_preds = artifacts.global_model.predict(global_sample[global_feature_cols])
+
+    global_imp = pd.DataFrame(
+        {"feature": global_feature_cols, "mean_abs_shap": np.abs(shap_global_vals).mean(axis=0)}
+    ).sort_values("mean_abs_shap", ascending=False)
+    global_imp.to_csv(run_dir / "global_feature_importance_shap.csv", index=False)
+
+    global_rows = global_sample[["id", "market", "delivery_start", "target"]].reset_index(drop=True)
+    global_rows = global_rows.assign(base_value=shap_global_base, prediction=global_preds)
+    shap_cols = pd.DataFrame(
+        shap_global_vals,
+        columns=[f"shap__{feat}" for feat in global_feature_cols],
+    )
+    global_rows = pd.concat([global_rows, shap_cols], axis=1)
+    global_rows.to_csv(run_dir / "global_shap_sample_rows.csv", index=False)
+
+    train_local = train_feat.copy()
+    train_local["global_pred_feature"] = artifacts.global_model.predict(train_feat[global_feature_cols])
+    local_rows: list[dict[str, object]] = []
+    local_cat_idx = _cat_indices(artifacts.feature_cols, artifacts.cat_cols)
+
+    for market, model in artifacts.local_models.items():
+        mdf = train_local.loc[train_local["market"].astype(str) == str(market)].copy()
+        if mdf.empty:
+            continue
+        ms = _sample_df(mdf, per_market_sample_size, seed)
+        pool = Pool(data=ms[artifacts.feature_cols], cat_features=local_cat_idx)
+        shap_local = model.get_feature_importance(pool, type="ShapValues")[:, :-1]
+        imp = np.abs(shap_local).mean(axis=0)
+        for feat, score in zip(artifacts.feature_cols, imp):
+            local_rows.append(
+                {"market": str(market), "feature": feat, "mean_abs_shap": float(score)}
+            )
+
+    pd.DataFrame(local_rows).sort_values(
+        ["market", "mean_abs_shap"], ascending=[True, False]
+    ).to_csv(run_dir / "local_feature_importance_shap.csv", index=False)
+
+    out_meta = {
+        "run_dir": str(run_dir),
+        "global_sample_size_used": int(len(global_sample)),
+        "per_market_sample_size_requested": int(per_market_sample_size),
+        "rows_train": int(len(train_feat)),
+        "global_feature_count": int(len(global_feature_cols)),
+        "local_feature_count": int(len(artifacts.feature_cols)),
+    }
+    (run_dir / "shap_metadata.json").write_text(json.dumps(out_meta, indent=2))
+
+    print("Saved SHAP outputs:")
+    print(f"- {run_dir / 'global_feature_importance_shap.csv'}")
+    print(f"- {run_dir / 'local_feature_importance_shap.csv'}")
+    print(f"- {run_dir / 'global_shap_sample_rows.csv'}")
+    print(f"- {run_dir / 'shap_metadata.json'}")
+
+
+def save_repro_artifacts(
+    run_dir: Path,
+    *,
+    args: argparse.Namespace,
+    cv_rmse: float | None,
+    train_rows: int,
+    test_rows: int,
+    candidate_features: list[str],
+    artifacts: TrainArtifacts,
+    model_file_map: dict[str, Any],
+) -> None:
+    train_path = Path(args.train_path)
+    test_path = Path(args.test_path)
+    sample_path = Path(args.sample_submission)
+
+    model_params = {
+        "global_model": {
+            "loss_function": "RMSE",
+            "eval_metric": "RMSE",
+            "iterations": 2500,
+            "learning_rate": 0.03,
+            "depth": 8,
+            "l2_leaf_reg": 18.0,
+            "bagging_temperature": 0.5,
+            "random_strength": 1.0,
+            "random_seed": 42,
+        },
+        "local_model": {
+            "loss_function": "RMSE",
+            "eval_metric": "RMSE",
+            "iterations": 3000,
+            "learning_rate": 0.025,
+            "depth": 8,
+            "l2_leaf_reg": 20.0,
+            "bagging_temperature": 0.4,
+            "random_strength": 0.9,
+            "random_seed": 42,
+        },
+    }
+
+    run_config = {
+        "script": Path(__file__).name,
+        "created_at_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "train_args": vars(args),
+        "data": {
+            "train_path": str(train_path),
+            "test_path": str(test_path),
+            "sample_submission_path": str(sample_path),
+            "train_sha256": _sha256_file(train_path),
+            "test_sha256": _sha256_file(test_path),
+            "sample_submission_sha256": _sha256_file(sample_path),
+            "train_rows": train_rows,
+            "test_rows": test_rows,
+        },
+        "model_params": model_params,
+        "features": {
+            "candidate_features_before_global_pred": candidate_features,
+            "local_feature_cols": artifacts.feature_cols,
+            "cat_cols": artifacts.cat_cols,
+        },
+        "metrics": {"cv_rmse": cv_rmse},
+    }
+    _write_yaml(run_dir / "run_config.yaml", run_config)
+
+    git_commit = _run_cmd(["git", "rev-parse", "HEAD"])
+    git_branch = _run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    git_status = _run_cmd(["git", "status", "--short"])
+    repro_context = {
+        "python_version": sys.version.split()[0],
+        "platform": platform.platform(),
+        "numpy_version": np.__version__,
+        "pandas_version": pd.__version__,
+        "catboost_version": getattr(sys.modules.get("catboost"), "__version__", None),
+        "git": {
+            "commit": git_commit,
+            "branch": git_branch,
+            "status_short": git_status,
+        },
+    }
+    (run_dir / "repro_context.json").write_text(
+        json.dumps(repro_context, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    model_metadata = {
+        "global_model": model_file_map.get("global_model"),
+        "local_models": model_file_map.get("local_models", {}),
+        "feature_cols": artifacts.feature_cols,
+        "cat_cols": artifacts.cat_cols,
+        "candidate_features_before_global_pred": candidate_features,
+        "cv_rmse": cv_rmse,
+        "train_args": vars(args),
+        "data_hashes": {
+            "train_sha256": _sha256_file(train_path),
+            "test_sha256": _sha256_file(test_path),
+            "sample_submission_sha256": _sha256_file(sample_path),
+        },
+    }
+    (run_dir / "model_metadata.json").write_text(
+        json.dumps(model_metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    print(f"Saved reproducibility config: {run_dir / 'run_config.yaml'}")
+    print(f"Saved reproducibility context: {run_dir / 'repro_context.json'}")
+    print(f"Saved model metadata: {run_dir / 'model_metadata.json'}")
+
+
 def make_time_series_folds(
     train_df: pd.DataFrame,
     n_folds: int,
@@ -271,7 +537,7 @@ def run_time_series_cv(
     val_days: int,
     step_days: int,
     min_train_days: int,
-) -> tuple[float | None, pd.DataFrame]:
+) -> tuple[float | None, pd.DataFrame, pd.DataFrame]:
     folds = make_time_series_folds(
         train_df=train_df_raw,
         n_folds=n_folds,
@@ -281,10 +547,11 @@ def run_time_series_cv(
     )
     if not folds:
         print("CV skipped: not enough history for requested folds.")
-        return None, pd.DataFrame()
+        return None, pd.DataFrame(), pd.DataFrame()
 
     start_all = _to_datetime_col(train_df_raw, "delivery_start")
     fold_rows: list[dict[str, object]] = []
+    oof_rows: list[pd.DataFrame] = []
     oof = pd.Series(index=train_df_raw.index, dtype=float)
 
     print(
@@ -355,6 +622,18 @@ def run_time_series_cv(
         for market, sdf in tmp.groupby("market"):
             m_rmse = _rmse(sdf["y_true"].to_numpy(), sdf["y_pred"].to_numpy())
             print(f"  - {market}: RMSE={m_rmse:.6f} (n={len(sdf)})")
+        oof_rows.append(
+            pd.DataFrame(
+                {
+                    "id": va["id"].to_numpy(dtype=int),
+                    "delivery_start": va["delivery_start"].to_numpy(),
+                    "market": va["market"].to_numpy(),
+                    "target": va["target"].to_numpy(dtype=float),
+                    "pred": pred,
+                    "fold": fold_idx,
+                }
+            )
+        )
         oof.loc[va.index] = pred
 
     coverage = float(oof.notna().mean())
@@ -367,7 +646,8 @@ def run_time_series_cv(
         )
     print(f"CV OOF coverage: {coverage:.4%}")
     print(f"CV OOF RMSE: {overall if overall is not None else 'None'}")
-    return overall, pd.DataFrame(fold_rows)
+    cv_oof = pd.concat(oof_rows, ignore_index=True) if oof_rows else pd.DataFrame()
+    return overall, pd.DataFrame(fold_rows), cv_oof
 
 
 def train_global_and_local_models(train_df: pd.DataFrame, feature_cols: list[str], cat_cols: list[str]) -> TrainArtifacts:
@@ -444,6 +724,42 @@ def main() -> None:
     parser.add_argument("--cv-val-days", type=int, default=14)
     parser.add_argument("--cv-step-days", type=int, default=14)
     parser.add_argument("--cv-min-train-days", type=int, default=90)
+    parser.add_argument(
+        "--save-shap",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute and save SHAP outputs after training (default: enabled).",
+    )
+    parser.add_argument(
+        "--save-models",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save fitted global/local CatBoost models in the run directory (default: enabled).",
+    )
+    parser.add_argument(
+        "--save-repro-artifacts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save YAML config + metadata/context files for reproducibility (default: enabled).",
+    )
+    parser.add_argument(
+        "--shap-global-sample-size",
+        type=int,
+        default=1500,
+        help="Sample size for global SHAP outputs (default: 1500).",
+    )
+    parser.add_argument(
+        "--shap-per-market-sample-size",
+        type=int,
+        default=400,
+        help="Sample size per market for local SHAP outputs (default: 400).",
+    )
+    parser.add_argument(
+        "--shap-seed",
+        type=int,
+        default=42,
+        help="Sampling seed for SHAP exports (default: 42).",
+    )
     args = parser.parse_args()
 
     train_df = pd.read_csv(args.train_path)
@@ -455,8 +771,9 @@ def main() -> None:
 
     cv_rmse = None
     cv_details = pd.DataFrame()
+    cv_oof = pd.DataFrame()
     if args.cv:
-        cv_rmse, cv_details = run_time_series_cv(
+        cv_rmse, cv_details, cv_oof = run_time_series_cv(
             train_df_raw=train_df,
             n_folds=args.cv_folds,
             val_days=args.cv_val_days,
@@ -505,7 +822,8 @@ def main() -> None:
     sub_path = run_dir / "submission.csv"
     out_sub.to_csv(sub_path, index=False)
 
-    latest_path = Path("submission_per_market_interactions.csv")
+    latest_path = Path("csv/submission_per_market_interactions.csv")
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
     out_sub.to_csv(latest_path, index=False)
 
     print(f"Saved submission: {sub_path}")
@@ -518,6 +836,67 @@ def main() -> None:
         cv_path = run_dir / "cv_results.csv"
         cv_details.to_csv(cv_path, index=False)
         print(f"Saved CV details: {cv_path}")
+    if not cv_oof.empty:
+        cv_oof_path = run_dir / "cv_oof.csv"
+        cv_oof.to_csv(cv_oof_path, index=False)
+        print(f"Saved CV OOF rows: {cv_oof_path}")
+
+        market_rows: list[dict[str, object]] = []
+        for market, sdf in cv_oof.groupby("market", dropna=False):
+            market_rows.append(
+                {
+                    "market": str(market),
+                    "rows": int(len(sdf)),
+                    "rmse": _rmse(
+                        sdf["target"].to_numpy(dtype=float),
+                        sdf["pred"].to_numpy(dtype=float),
+                    ),
+                }
+            )
+        cv_market = pd.DataFrame(market_rows).sort_values("market").reset_index(drop=True)
+        cv_market_path = run_dir / "cv_market_results.csv"
+        cv_market.to_csv(cv_market_path, index=False)
+        print(f"Saved CV market details: {cv_market_path}")
+    model_file_map: dict[str, Any] = {"global_model": None, "local_models": {}}
+    if args.save_models:
+        models_dir = run_dir / "models"
+        models_dir.mkdir(parents=True, exist_ok=True)
+
+        global_model_path = models_dir / "global_model.cbm"
+        artifacts.global_model.save_model(global_model_path)
+        model_file_map["global_model"] = str(global_model_path.name)
+
+        local_model_paths: dict[str, str] = {}
+        for market, model in artifacts.local_models.items():
+            safe_market = str(market).replace(" ", "_")
+            local_path = models_dir / f"local_model_{safe_market}.cbm"
+            model.save_model(local_path)
+            local_model_paths[str(market)] = str(local_path.name)
+        model_file_map["local_models"] = local_model_paths
+        print(f"Saved models dir: {models_dir}")
+
+    if args.save_repro_artifacts:
+        save_repro_artifacts(
+            run_dir=run_dir,
+            args=args,
+            cv_rmse=cv_rmse,
+            train_rows=len(train_df),
+            test_rows=len(test_df),
+            candidate_features=candidate_features,
+            artifacts=artifacts,
+            model_file_map=model_file_map,
+        )
+
+    if args.save_shap:
+        save_shap_outputs(
+            run_dir=run_dir,
+            train_feat=train_feat,
+            artifacts=artifacts,
+            global_feature_cols=candidate_features,
+            global_sample_size=args.shap_global_sample_size,
+            per_market_sample_size=args.shap_per_market_sample_size,
+            seed=args.shap_seed,
+        )
 
 
 if __name__ == "__main__":

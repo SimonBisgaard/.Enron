@@ -23,14 +23,14 @@ def _find_run(registry: Path, run_id: str) -> dict[str, str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Tag the commit associated with a run_id from experiments.csv")
-    parser.add_argument("--run-id", required=True, help="Run ID present in experiments.csv")
+    parser = argparse.ArgumentParser(description="Tag the commit associated with a run_id from csv/experiments.csv")
+    parser.add_argument("--run-id", required=True, help="Run ID present in csv/experiments.csv")
     parser.add_argument("--tag", required=True, help="Tag name, e.g. exp/best-cv-123")
-    parser.add_argument("--registry", default="experiments.csv", help="Path to experiments registry CSV")
+    parser.add_argument("--registry", default="csv/experiments.csv", help="Path to experiments registry CSV")
     parser.add_argument("--push", action="store_true", help="Also push tag to origin")
     args = parser.parse_args()
 
-    repo_root = Path(__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parent.parent
     registry_path = (repo_root / args.registry).resolve() if not Path(args.registry).is_absolute() else Path(args.registry)
 
     run_row = _find_run(registry_path, args.run_id)

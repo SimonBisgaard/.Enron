@@ -606,6 +606,20 @@ def apply_exclude_2023(df: pd.DataFrame, keep_from_month: int = 10) -> pd.DataFr
     return out.loc[keep_mask].copy()
 
 
+def apply_train_start_cutoff(df: pd.DataFrame, start_date: str) -> pd.DataFrame:
+    out = df.copy()
+    start = _to_datetime_col(out, "delivery_start")
+    cutoff = pd.Timestamp(start_date)
+    keep_mask = start >= cutoff
+    removed = int((~keep_mask).sum())
+    kept = int(keep_mask.sum())
+    print(
+        "Train start cutoff mode: "
+        f"start_date={cutoff.date()}, removed={removed}, kept={kept}"
+    )
+    return out.loc[keep_mask].copy()
+
+
 @dataclass
 class TrainArtifacts:
     global_model: CatBoostRegressor
@@ -1213,6 +1227,12 @@ def main() -> None:
     parser.add_argument("--name", default="per_market_interactions_commit_baseline")
     parser.add_argument("--exclude-2023", action="store_true")
     parser.add_argument("--exclude-2023-keep-from-month", type=int, default=10)
+    parser.add_argument(
+        "--train-start-july-2024",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Restrict training rows to delivery_start >= 2024-07-01 (default: disabled).",
+    )
     parser.add_argument("--cv", action="store_true")
     parser.add_argument("--cv-folds", type=int, default=5)
     parser.add_argument("--cv-val-days", type=int, default=14)
@@ -1423,6 +1443,8 @@ def main() -> None:
         non_baseline_flags.append(f"loss_function={args.loss_function}")
     if args.use_tail_experts:
         non_baseline_flags.append("use_tail_experts")
+    if args.train_start_july_2024:
+        non_baseline_flags.append("train_start_july_2024")
 
     if non_baseline_flags:
         print("Non-baseline toggles enabled: " + ", ".join(non_baseline_flags))
@@ -1437,6 +1459,8 @@ def main() -> None:
 
     if args.exclude_2023:
         train_df = apply_exclude_2023(train_df, keep_from_month=args.exclude_2023_keep_from_month)
+    if args.train_start_july_2024:
+        train_df = apply_train_start_cutoff(train_df, start_date="2024-07-01")
 
     cv_rmse = None
     cv_details = pd.DataFrame()
@@ -1552,7 +1576,8 @@ def main() -> None:
     sub_path = run_dir / "submission.csv"
     out_sub.to_csv(sub_path, index=False)
 
-    latest_path = Path("submission_per_market_interactions_commit_baseline.csv")
+    latest_path = Path("csv/submission_per_market_interactions_commit_baseline.csv")
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
     out_sub.to_csv(latest_path, index=False)
 
     print(f"Saved submission: {sub_path}")
@@ -1655,7 +1680,7 @@ def main() -> None:
                     "gate/tail blending logic is not decomposed in the SHAP output."
                 )
             shap_cmd = [
-                Path(__file__).with_name("shap_from_saved_models.py").as_posix(),
+                (Path(__file__).resolve().parent / "helpers" / "shap_from_saved_models.py").as_posix(),
                 "--run-dir",
                 str(run_dir),
                 "--global-sample-size",

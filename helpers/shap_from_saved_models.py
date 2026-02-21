@@ -4,10 +4,15 @@ import argparse
 import inspect
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor, Pool
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from train_per_market_interactions import (
     apply_exclude_2023 as apply_exclude_2023_base,

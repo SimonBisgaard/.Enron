@@ -176,10 +176,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--best-submission-path",
-        default="submissio.csv",
-        help="Best reference submission file. If missing, falls back to best CV run in experiments.csv.",
+        default="csv/submissio.csv",
+        help="Best reference submission file. If missing, falls back to best CV run in csv/experiments.csv.",
     )
-    parser.add_argument("--registry", default="experiments.csv")
+    parser.add_argument("--registry", default="csv/experiments.csv")
     parser.add_argument("--mode", choices=["upper", "two_sided", "abs"], default="upper")
     parser.add_argument("--upper-quantile", type=float, default=0.99)
     parser.add_argument("--lower-quantile", type=float, default=0.01)

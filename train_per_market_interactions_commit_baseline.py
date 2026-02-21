@@ -214,7 +214,12 @@ def add_volatility_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def add_meteo_features(df: pd.DataFrame, *, use_peak_interactions: bool) -> pd.DataFrame:
+def add_meteo_features(
+    df: pd.DataFrame,
+    *,
+    use_peak_interactions: bool,
+    use_ws80_turbine_features: bool,
+) -> pd.DataFrame:
     out = df.copy()
 
     if {"wind_gust_speed_10m", "wind_speed_10m"}.issubset(out.columns):
@@ -249,7 +254,7 @@ def add_meteo_features(df: pd.DataFrame, *, use_peak_interactions: bool) -> pd.D
                 out["solar_forecast"] > 0.0
             ).astype(int)
 
-    if "wind_speed_80m" in out.columns:
+    if use_ws80_turbine_features and "wind_speed_80m" in out.columns:
         ws80 = out["wind_speed_80m"]
         out["ws80_sq"] = ws80**2
         out["ws80_cu"] = ws80**3
@@ -605,27 +610,23 @@ def apply_exclude_2023(df: pd.DataFrame, keep_from_month: int = 10) -> pd.DataFr
 class TrainArtifacts:
     global_model: CatBoostRegressor
     local_models: dict[str, CatBoostRegressor]
-    local_side_models: dict[str, CatBoostClassifier]
-    local_pos_size_models: dict[str, CatBoostRegressor]
-    local_neg_size_models: dict[str, CatBoostRegressor]
-    local_peak_gate_models: dict[str, CatBoostClassifier]
-    local_peak_uplift_models: dict[str, CatBoostRegressor]
-    local_peak_uplift_caps: dict[str, float]
+    local_tail_models: dict[str, CatBoostRegressor]
+    local_gate_models: dict[str, CatBoostClassifier]
     feature_cols: list[str]
     cat_cols: list[str]
     local_target_is_residual: bool
     local_uses_global_pred_feature: bool
     target_transform_state: TargetTransformState
-    use_side_size_modeling: bool
-    side_size_min_rows: int
-    use_peak_head: bool
-    peak_label_quantile: float
-    peak_hour_min_rows: int
-    peak_min_rows: int
-    peak_gate_threshold: float
-    peak_blend_mode: str
-    peak_uplift_positive_only: bool
-    peak_uplift_cap_quantile: float
+    use_tail_experts: bool
+    tail_label_mode: str
+    tail_quantile_upper: float
+    tail_quantile_lower: float
+    tail_gate_threshold: float
+    tail_blend_mode: str
+    tail_delta_clip: float | None
+    tail_model_mode: str
+    tail_weight: float
+    tail_min_rows: int
 
 
 def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -693,7 +694,7 @@ def _predict_point(model: CatBoostRegressor, X: pd.DataFrame) -> np.ndarray:
     return pred.astype(float)
 
 
-def _predict_binary_probability(model: CatBoostClassifier, X: pd.DataFrame) -> np.ndarray:
+def _predict_tail_probability(model: CatBoostClassifier, X: pd.DataFrame) -> np.ndarray:
     proba = np.asarray(model.predict_proba(X))
     if proba.ndim == 2 and proba.shape[1] >= 2:
         return proba[:, 1].astype(float)
@@ -702,34 +703,55 @@ def _predict_binary_probability(model: CatBoostClassifier, X: pd.DataFrame) -> n
     return proba.astype(float)
 
 
-def _compute_peak_mask_per_market_hour(
+def _compute_tail_mask_per_market(
     y_true: pd.Series,
-    hour_col: pd.Series,
+    market_col: pd.Series,
     *,
-    quantile: float,
-    hour_min_rows: int,
+    label_mode: str,
+    quantile_upper: float,
+    quantile_lower: float,
 ) -> np.ndarray:
-    tmp = pd.DataFrame({"y": y_true.to_numpy(dtype=float), "hour": hour_col.to_numpy()})
-    market_q = float(tmp["y"].quantile(quantile))
+    tmp = pd.DataFrame({"y": y_true.to_numpy(dtype=float), "market": market_col.astype(str).to_numpy()})
     mask = np.zeros(len(tmp), dtype=bool)
-    for _, idx in tmp.groupby("hour", dropna=False, sort=False).groups.items():
+    for _, idx in tmp.groupby("market", dropna=False, sort=False).groups.items():
         pos = np.asarray(idx, dtype=int)
         vals = tmp.iloc[pos]["y"]
-        q = float(vals.quantile(quantile)) if len(vals) >= hour_min_rows else market_q
-        mask[pos] = vals.to_numpy(dtype=float) >= q
+        q_hi = float(vals.quantile(quantile_upper))
+        if label_mode == "upper":
+            local = vals >= q_hi
+        elif label_mode == "two_sided":
+            q_lo = float(vals.quantile(quantile_lower))
+            local = (vals >= q_hi) | (vals <= q_lo)
+        else:
+            raise ValueError(f"Unsupported tail label mode: {label_mode}")
+        mask[pos] = local.to_numpy()
     return mask
 
 
-def _compute_gate_weight(prob: np.ndarray, threshold: float, mode: str) -> np.ndarray:
-    if mode == "hard":
-        return (prob >= threshold).astype(float)
-    if mode == "soft":
-        denom = max(1.0 - threshold, 1e-6)
-        return np.clip((prob - threshold) / denom, 0.0, 1.0)
-    raise ValueError(f"Unsupported peak blend mode: {mode}")
+def _blend_tail_expert_prediction(
+    *,
+    normal_pred: np.ndarray,
+    tail_pred: np.ndarray,
+    tail_prob: np.ndarray,
+    gate_threshold: float,
+    blend_mode: str,
+    delta_clip: float | None,
+) -> np.ndarray:
+    if blend_mode == "hard":
+        weight = (tail_prob >= gate_threshold).astype(float)
+    elif blend_mode == "soft":
+        denom = max(1.0 - gate_threshold, 1e-6)
+        weight = np.clip((tail_prob - gate_threshold) / denom, 0.0, 1.0)
+    else:
+        raise ValueError(f"Unsupported tail blend mode: {blend_mode}")
+
+    delta = tail_pred - normal_pred
+    if delta_clip is not None and delta_clip > 0:
+        delta = np.clip(delta, -delta_clip, delta_clip)
+    return normal_pred + weight * delta
 
 
-def _predict_local_side_size(
+def _predict_local_expert(
     artifacts: TrainArtifacts,
     market: str,
     X: pd.DataFrame,
@@ -739,36 +761,23 @@ def _predict_local_side_size(
         raise KeyError(f"Missing normal local model for market={market}")
     normal_pred = _predict_point(normal_model, X[artifacts.feature_cols])
 
-    local_pred = normal_pred
-    if artifacts.use_side_size_modeling:
-        side_model = artifacts.local_side_models.get(str(market))
-        pos_size_model = artifacts.local_pos_size_models.get(str(market))
-        neg_size_model = artifacts.local_neg_size_models.get(str(market))
-        if side_model is not None and pos_size_model is not None and neg_size_model is not None:
-            p_neg = _predict_binary_probability(side_model, X[artifacts.feature_cols])
-            pos_size = np.clip(_predict_point(pos_size_model, X[artifacts.feature_cols]), 0.0, None)
-            neg_size = np.clip(_predict_point(neg_size_model, X[artifacts.feature_cols]), 0.0, None)
-            local_pred = (1.0 - p_neg) * pos_size - p_neg * neg_size
+    if not artifacts.use_tail_experts:
+        return normal_pred
+    tail_model = artifacts.local_tail_models.get(str(market))
+    gate_model = artifacts.local_gate_models.get(str(market))
+    if tail_model is None or gate_model is None:
+        return normal_pred
 
-    if not artifacts.use_peak_head:
-        return local_pred
-    peak_gate = artifacts.local_peak_gate_models.get(str(market))
-    peak_uplift = artifacts.local_peak_uplift_models.get(str(market))
-    if peak_gate is None or peak_uplift is None:
-        return local_pred
-
-    p_peak = _predict_binary_probability(peak_gate, X[artifacts.feature_cols])
-    peak_weight = _compute_gate_weight(p_peak, artifacts.peak_gate_threshold, artifacts.peak_blend_mode)
-    uplift = _predict_point(peak_uplift, X[artifacts.feature_cols])
-    if artifacts.peak_uplift_positive_only:
-        uplift = np.clip(uplift, 0.0, None)
-    cap = artifacts.local_peak_uplift_caps.get(str(market))
-    if cap is not None and np.isfinite(cap) and cap > 0:
-        if artifacts.peak_uplift_positive_only:
-            uplift = np.clip(uplift, 0.0, cap)
-        else:
-            uplift = np.clip(uplift, -cap, cap)
-    return local_pred + peak_weight * uplift
+    tail_pred = _predict_point(tail_model, X[artifacts.feature_cols])
+    tail_prob = _predict_tail_probability(gate_model, X[artifacts.feature_cols])
+    return _blend_tail_expert_prediction(
+        normal_pred=normal_pred,
+        tail_pred=tail_pred,
+        tail_prob=tail_prob,
+        gate_threshold=artifacts.tail_gate_threshold,
+        blend_mode=artifacts.tail_blend_mode,
+        delta_clip=artifacts.tail_delta_clip,
+    )
 
 
 def make_time_series_folds(
@@ -807,6 +816,7 @@ def run_time_series_cv(
     use_temporal_regime: bool,
     use_volatility_regime: bool,
     use_wind_proxy: bool,
+    use_ws80_turbine_features: bool,
     use_anomaly_features: bool,
     use_cross_market_rank_features: bool,
     use_peak_interactions: bool,
@@ -814,28 +824,16 @@ def run_time_series_cv(
     include_global_pred_in_local: bool,
     loss_function: str,
     target_transform: str,
-    global_iterations: int,
-    global_learning_rate: float,
-    global_depth: int,
-    global_l2_leaf_reg: float,
-    global_bagging_temperature: float,
-    global_random_strength: float,
-    local_iterations: int,
-    local_learning_rate: float,
-    local_depth: int,
-    local_l2_leaf_reg: float,
-    local_bagging_temperature: float,
-    local_random_strength: float,
-    use_side_size_modeling: bool,
-    side_size_min_rows: int,
-    use_peak_head: bool,
-    peak_label_quantile: float,
-    peak_hour_min_rows: int,
-    peak_min_rows: int,
-    peak_gate_threshold: float,
-    peak_blend_mode: str,
-    peak_uplift_positive_only: bool,
-    peak_uplift_cap_quantile: float,
+    use_tail_experts: bool,
+    tail_label_mode: str,
+    tail_quantile_upper: float,
+    tail_quantile_lower: float,
+    tail_model_mode: str,
+    tail_weight: float,
+    tail_min_rows: int,
+    tail_gate_threshold: float,
+    tail_blend_mode: str,
+    tail_delta_clip: float | None,
 ) -> tuple[float | None, pd.DataFrame, pd.DataFrame]:
     folds = make_time_series_folds(
         train_df=train_df_raw,
@@ -879,6 +877,7 @@ def run_time_series_cv(
             use_temporal_regime=use_temporal_regime,
             use_volatility_regime=use_volatility_regime,
             use_wind_proxy=use_wind_proxy,
+            use_ws80_turbine_features=use_ws80_turbine_features,
             use_anomaly_features=use_anomaly_features,
             use_cross_market_rank_features=use_cross_market_rank_features,
             use_peak_interactions=use_peak_interactions,
@@ -900,28 +899,16 @@ def run_time_series_cv(
             include_global_pred_in_local=include_global_pred_in_local,
             loss_function=loss_function,
             target_transform=target_transform,
-            global_iterations=global_iterations,
-            global_learning_rate=global_learning_rate,
-            global_depth=global_depth,
-            global_l2_leaf_reg=global_l2_leaf_reg,
-            global_bagging_temperature=global_bagging_temperature,
-            global_random_strength=global_random_strength,
-            local_iterations=local_iterations,
-            local_learning_rate=local_learning_rate,
-            local_depth=local_depth,
-            local_l2_leaf_reg=local_l2_leaf_reg,
-            local_bagging_temperature=local_bagging_temperature,
-            local_random_strength=local_random_strength,
-            use_side_size_modeling=use_side_size_modeling,
-            side_size_min_rows=side_size_min_rows,
-            use_peak_head=use_peak_head,
-            peak_label_quantile=peak_label_quantile,
-            peak_hour_min_rows=peak_hour_min_rows,
-            peak_min_rows=peak_min_rows,
-            peak_gate_threshold=peak_gate_threshold,
-            peak_blend_mode=peak_blend_mode,
-            peak_uplift_positive_only=peak_uplift_positive_only,
-            peak_uplift_cap_quantile=peak_uplift_cap_quantile,
+            use_tail_experts=use_tail_experts,
+            tail_label_mode=tail_label_mode,
+            tail_quantile_upper=tail_quantile_upper,
+            tail_quantile_lower=tail_quantile_lower,
+            tail_model_mode=tail_model_mode,
+            tail_weight=tail_weight,
+            tail_min_rows=tail_min_rows,
+            tail_gate_threshold=tail_gate_threshold,
+            tail_blend_mode=tail_blend_mode,
+            tail_delta_clip=tail_delta_clip,
         )
         va_feat = va_feat.copy()
         va_feat["global_pred_feature"] = _predict_point(artifacts.global_model, va_feat[feat_cols])
@@ -933,7 +920,7 @@ def run_time_series_cv(
             if normal_model is None:
                 pred[idx] = va_feat.loc[idx, "global_pred_feature"].to_numpy(dtype=float)
             else:
-                local_pred = _predict_local_side_size(
+                local_pred = _predict_local_expert(
                     artifacts=artifacts,
                     market=str(market),
                     X=va_feat.loc[idx],
@@ -949,14 +936,16 @@ def run_time_series_cv(
 
         fold_rmse = _rmse(va["target"].to_numpy(dtype=float), pred_original)
         print(f"CV fold {fold_idx} RMSE={fold_rmse:.6f}")
-        fold_row: dict[str, object] = {
-            "fold": fold_idx,
-            "val_start": str(val_start.date()),
-            "val_end": str(val_end.date()),
-            "rmse": fold_rmse,
-            "train_rows": len(tr),
-            "val_rows": len(va),
-        }
+        fold_rows.append(
+            {
+                "fold": fold_idx,
+                "val_start": str(val_start.date()),
+                "val_end": str(val_end.date()),
+                "rmse": fold_rmse,
+                "train_rows": len(tr),
+                "val_rows": len(va),
+            }
+        )
 
         tmp = pd.DataFrame(
             {
@@ -969,33 +958,9 @@ def run_time_series_cv(
                 "fold": fold_idx,
             }
         )
-        peak_precisions: list[float] = []
-        peak_recalls: list[float] = []
         for market, sdf in tmp.groupby("market"):
             m_rmse = _rmse(sdf["y_true"].to_numpy(), sdf["y_pred"].to_numpy())
             print(f"  - {market}: RMSE={m_rmse:.6f} (n={len(sdf)})")
-            y_true_m = sdf["y_true"].to_numpy(dtype=float)
-            y_pred_m = sdf["y_pred"].to_numpy(dtype=float)
-            q_m = float(np.quantile(y_true_m, peak_label_quantile))
-            actual_peak = y_true_m >= q_m
-            pred_peak = y_pred_m >= q_m
-            tp = int(np.sum(actual_peak & pred_peak))
-            fp = int(np.sum((~actual_peak) & pred_peak))
-            fn = int(np.sum(actual_peak & (~pred_peak)))
-            prec = float(tp / (tp + fp)) if (tp + fp) > 0 else float("nan")
-            rec = float(tp / (tp + fn)) if (tp + fn) > 0 else float("nan")
-            peak_precisions.append(prec)
-            peak_recalls.append(rec)
-            print(
-                f"    peaks@q{peak_label_quantile:.3f}: "
-                f"precision={prec:.4f} recall={rec:.4f} tp={tp} fp={fp} fn={fn}"
-            )
-        if peak_precisions:
-            valid_prec = [x for x in peak_precisions if np.isfinite(x)]
-            valid_rec = [x for x in peak_recalls if np.isfinite(x)]
-            fold_row["peak_precision_mean"] = float(np.mean(valid_prec)) if valid_prec else None
-            fold_row["peak_recall_mean"] = float(np.mean(valid_rec)) if valid_rec else None
-        fold_rows.append(fold_row)
         oof_rows.append(
             tmp.rename(columns={"y_true": "target", "y_pred": "pred"})[
                 ["id", "delivery_start", "market", "target", "pred", "fold"]
@@ -1026,43 +991,25 @@ def train_global_and_local_models(
     include_global_pred_in_local: bool,
     loss_function: str = "RMSE",
     target_transform: str = "none",
-    global_iterations: int = 1200,
-    global_learning_rate: float = 0.03,
-    global_depth: int = 6,
-    global_l2_leaf_reg: float = 45.0,
-    global_bagging_temperature: float = 1.0,
-    global_random_strength: float = 1.4,
-    local_iterations: int = 1400,
-    local_learning_rate: float = 0.03,
-    local_depth: int = 6,
-    local_l2_leaf_reg: float = 50.0,
-    local_bagging_temperature: float = 1.0,
-    local_random_strength: float = 1.3,
-    use_side_size_modeling: bool = False,
-    side_size_min_rows: int = 240,
-    use_peak_head: bool = False,
-    peak_label_quantile: float = 0.99,
-    peak_hour_min_rows: int = 96,
-    peak_min_rows: int = 80,
-    peak_gate_threshold: float = 0.6,
-    peak_blend_mode: str = "soft",
-    peak_uplift_positive_only: bool = True,
-    peak_uplift_cap_quantile: float = 0.995,
+    use_tail_experts: bool = False,
+    tail_label_mode: str = "upper",
+    tail_quantile_upper: float = 0.99,
+    tail_quantile_lower: float = 0.01,
+    tail_model_mode: str = "tail_only",
+    tail_weight: float = 6.0,
+    tail_min_rows: int = 120,
+    tail_gate_threshold: float = 0.95,
+    tail_blend_mode: str = "soft",
+    tail_delta_clip: float | None = 250.0,
 ) -> TrainArtifacts:
-    if side_size_min_rows < 1:
-        raise ValueError("--side-size-min-rows must be >= 1")
-    if not (0.0 < peak_label_quantile < 1.0):
-        raise ValueError("--peak-label-quantile must be in (0,1)")
-    if peak_hour_min_rows < 1:
-        raise ValueError("--peak-hour-min-rows must be >= 1")
-    if peak_min_rows < 1:
-        raise ValueError("--peak-min-rows must be >= 1")
-    if not (0.0 <= peak_gate_threshold < 1.0):
-        raise ValueError("--peak-gate-threshold must be in [0,1)")
-    if peak_blend_mode not in {"soft", "hard"}:
-        raise ValueError("--peak-blend-mode must be one of: soft, hard")
-    if not (0.0 < peak_uplift_cap_quantile <= 1.0):
-        raise ValueError("--peak-uplift-cap-quantile must be in (0,1]")
+    if not (0.0 < tail_quantile_upper < 1.0):
+        raise ValueError("--tail-quantile-upper must be in (0,1)")
+    if not (0.0 < tail_quantile_lower < 1.0):
+        raise ValueError("--tail-quantile-lower must be in (0,1)")
+    if tail_quantile_lower >= tail_quantile_upper:
+        raise ValueError("--tail-quantile-lower must be < --tail-quantile-upper")
+    if not (0.0 <= tail_gate_threshold < 1.0):
+        raise ValueError("--tail-gate-threshold must be in [0,1)")
 
     transformed_target, t_state = _fit_target_transform(
         train_df["target"].to_numpy(dtype=float),
@@ -1072,12 +1019,12 @@ def train_global_and_local_models(
     global_model = CatBoostRegressor(
         loss_function=loss_function,
         eval_metric="RMSE",
-        iterations=global_iterations,
-        learning_rate=global_learning_rate,
-        depth=global_depth,
-        l2_leaf_reg=global_l2_leaf_reg,
-        bagging_temperature=global_bagging_temperature,
-        random_strength=global_random_strength,
+        iterations=2500,
+        learning_rate=0.03,
+        depth=8,
+        l2_leaf_reg=18.0,
+        bagging_temperature=0.5,
+        random_strength=1.0,
         random_seed=42,
         verbose=0,
     )
@@ -1090,22 +1037,18 @@ def train_global_and_local_models(
     if include_global_pred_in_local:
         local_feature_cols = local_feature_cols + ["global_pred_feature"]
     local_models: dict[str, CatBoostRegressor] = {}
-    local_side_models: dict[str, CatBoostClassifier] = {}
-    local_pos_size_models: dict[str, CatBoostRegressor] = {}
-    local_neg_size_models: dict[str, CatBoostRegressor] = {}
-    local_peak_gate_models: dict[str, CatBoostClassifier] = {}
-    local_peak_uplift_models: dict[str, CatBoostRegressor] = {}
-    local_peak_uplift_caps: dict[str, float] = {}
+    local_tail_models: dict[str, CatBoostRegressor] = {}
+    local_gate_models: dict[str, CatBoostClassifier] = {}
     for market, mdf in train_df.groupby("market", dropna=False):
         normal_model = CatBoostRegressor(
             loss_function=loss_function,
             eval_metric="RMSE",
-            iterations=local_iterations,
-            learning_rate=local_learning_rate,
-            depth=local_depth,
-            l2_leaf_reg=local_l2_leaf_reg,
-            bagging_temperature=local_bagging_temperature,
-            random_strength=local_random_strength,
+            iterations=3000,
+            learning_rate=0.025,
+            depth=8,
+            l2_leaf_reg=20.0,
+            bagging_temperature=0.4,
+            random_strength=0.9,
             random_seed=42,
             verbose=0,
         )
@@ -1120,185 +1063,98 @@ def train_global_and_local_models(
         local_models[str(market)] = normal_model
         print(f"Trained local model for {market} ({len(mdf)} rows)")
 
-        side_model: CatBoostClassifier | None = None
-        pos_size_model: CatBoostRegressor | None = None
-        neg_size_model: CatBoostRegressor | None = None
-
-        if use_side_size_modeling:
-            neg_mask = local_target_np < 0.0
-            pos_mask = ~neg_mask
-            n_neg = int(neg_mask.sum())
-            n_pos = int(pos_mask.sum())
-            if n_neg < side_size_min_rows or n_pos < side_size_min_rows:
-                print(
-                    f"Skipped side/size for {market}: "
-                    f"neg_rows={n_neg}, pos_rows={n_pos}, required_min={side_size_min_rows}"
-                )
-            else:
-                side_labels = neg_mask.astype(int)
-                side_model = CatBoostClassifier(
-                    loss_function="Logloss",
-                    eval_metric="AUC",
-                    iterations=500,
-                    learning_rate=0.035,
-                    depth=5,
-                    l2_leaf_reg=25.0,
-                    auto_class_weights="Balanced",
-                    random_seed=42,
-                    verbose=0,
-                )
-                side_model.fit(mdf[local_feature_cols], side_labels, cat_features=local_cat_cols)
-                local_side_models[str(market)] = side_model
-
-                pos_size_model = CatBoostRegressor(
-                    loss_function=loss_function,
-                    eval_metric="RMSE",
-                    iterations=900,
-                    learning_rate=0.03,
-                    depth=5,
-                    l2_leaf_reg=40.0,
-                    bagging_temperature=1.0,
-                    random_strength=1.2,
-                    random_seed=42,
-                    verbose=0,
-                )
-                pos_size_model.fit(
-                    mdf.loc[pos_mask, local_feature_cols],
-                    local_target_np[pos_mask],
-                    cat_features=local_cat_cols,
-                )
-                local_pos_size_models[str(market)] = pos_size_model
-
-                neg_size_model = CatBoostRegressor(
-                    loss_function=loss_function,
-                    eval_metric="RMSE",
-                    iterations=900,
-                    learning_rate=0.03,
-                    depth=5,
-                    l2_leaf_reg=40.0,
-                    bagging_temperature=1.0,
-                    random_strength=1.2,
-                    random_seed=42,
-                    verbose=0,
-                )
-                neg_size_model.fit(
-                    mdf.loc[neg_mask, local_feature_cols],
-                    -local_target_np[neg_mask],
-                    cat_features=local_cat_cols,
-                )
-                local_neg_size_models[str(market)] = neg_size_model
-
-                print(
-                    f"Trained side/size for {market} "
-                    f"(neg_rows={n_neg}, pos_rows={n_pos})"
-                )
-
-        if not use_peak_head:
+        if not use_tail_experts:
             continue
 
-        if "hour" in mdf.columns:
-            local_hour = mdf["hour"]
-        else:
-            local_hour = _to_datetime_col(mdf, "delivery_start").dt.hour
-        peak_mask = _compute_peak_mask_per_market_hour(
+        tail_mask = _compute_tail_mask_per_market(
             mdf["target"],
-            local_hour,
-            quantile=peak_label_quantile,
-            hour_min_rows=peak_hour_min_rows,
+            mdf["market"],
+            label_mode=tail_label_mode,
+            quantile_upper=tail_quantile_upper,
+            quantile_lower=tail_quantile_lower,
         )
-        n_peak = int(peak_mask.sum())
-        if n_peak < peak_min_rows or n_peak >= len(mdf):
+        n_tail = int(tail_mask.sum())
+        if n_tail < tail_min_rows or n_tail >= len(mdf):
             print(
-                f"Skipped peak head for {market}: "
-                f"peak_rows={n_peak}, required_min={peak_min_rows}"
+                f"Skipped tail expert for {market}: "
+                f"tail_rows={n_tail}, required_min={tail_min_rows}"
             )
             continue
 
-        peak_labels = peak_mask.astype(int)
-        if peak_labels.min() == peak_labels.max():
-            print(f"Skipped peak gate for {market}: single-class labels")
+        gate_labels = tail_mask.astype(int)
+        if gate_labels.min() == gate_labels.max():
+            print(f"Skipped tail gate for {market}: single-class labels")
             continue
 
-        peak_gate_model = CatBoostClassifier(
+        gate_model = CatBoostClassifier(
             loss_function="Logloss",
             eval_metric="AUC",
-            iterations=500,
-            learning_rate=0.035,
-            depth=5,
-            l2_leaf_reg=25.0,
+            iterations=900,
+            learning_rate=0.04,
+            depth=6,
+            l2_leaf_reg=12.0,
             auto_class_weights="Balanced",
             random_seed=42,
             verbose=0,
         )
-        peak_gate_model.fit(mdf[local_feature_cols], peak_labels, cat_features=local_cat_cols)
-        local_peak_gate_models[str(market)] = peak_gate_model
+        gate_model.fit(mdf[local_feature_cols], gate_labels, cat_features=local_cat_cols)
+        local_gate_models[str(market)] = gate_model
 
-        if side_model is not None and pos_size_model is not None and neg_size_model is not None:
-            p_neg_train = _predict_binary_probability(side_model, mdf[local_feature_cols])
-            pos_size_train = np.clip(_predict_point(pos_size_model, mdf[local_feature_cols]), 0.0, None)
-            neg_size_train = np.clip(_predict_point(neg_size_model, mdf[local_feature_cols]), 0.0, None)
-            base_local_pred = (1.0 - p_neg_train) * pos_size_train - p_neg_train * neg_size_train
-        else:
-            base_local_pred = _predict_point(normal_model, mdf[local_feature_cols])
-
-        uplift_target = local_target_np - base_local_pred
-        peak_uplift_model = CatBoostRegressor(
+        tail_model = CatBoostRegressor(
             loss_function=loss_function,
             eval_metric="RMSE",
-            iterations=900,
+            iterations=2200,
             learning_rate=0.03,
-            depth=5,
-            l2_leaf_reg=40.0,
-            bagging_temperature=1.0,
-            random_strength=1.2,
+            depth=7,
+            l2_leaf_reg=24.0,
+            bagging_temperature=0.6,
+            random_strength=1.1,
             random_seed=42,
             verbose=0,
         )
-        peak_uplift_model.fit(
-            mdf.loc[peak_mask, local_feature_cols],
-            uplift_target[peak_mask],
-            cat_features=local_cat_cols,
-        )
-        local_peak_uplift_models[str(market)] = peak_uplift_model
-
-        if peak_uplift_positive_only:
-            cap_source = uplift_target[peak_mask]
-            cap_source = cap_source[cap_source > 0]
-            cap_val = float(np.quantile(cap_source, peak_uplift_cap_quantile)) if len(cap_source) > 0 else 0.0
+        if tail_model_mode == "tail_only":
+            tail_model.fit(
+                mdf.loc[tail_mask, local_feature_cols],
+                local_target_np[tail_mask],
+                cat_features=local_cat_cols,
+            )
+        elif tail_model_mode == "weighted_all":
+            sample_weight = np.ones(len(mdf), dtype=float)
+            sample_weight[tail_mask] = float(tail_weight)
+            tail_model.fit(
+                mdf[local_feature_cols],
+                local_target_np,
+                cat_features=local_cat_cols,
+                sample_weight=sample_weight,
+            )
         else:
-            cap_val = float(np.quantile(np.abs(uplift_target[peak_mask]), peak_uplift_cap_quantile))
-        if np.isfinite(cap_val) and cap_val > 0:
-            local_peak_uplift_caps[str(market)] = cap_val
-
+            raise ValueError(f"Unsupported tail model mode: {tail_model_mode}")
+        local_tail_models[str(market)] = tail_model
         print(
-            f"Trained peak head for {market} "
-            f"(peak_rows={n_peak}, gate_tau={peak_gate_threshold}, uplift_cap={cap_val:.3f})"
+            f"Trained tail expert for {market} "
+            f"(tail_rows={n_tail}, mode={tail_model_mode})"
         )
 
     return TrainArtifacts(
         global_model=global_model,
         local_models=local_models,
-        local_side_models=local_side_models,
-        local_pos_size_models=local_pos_size_models,
-        local_neg_size_models=local_neg_size_models,
-        local_peak_gate_models=local_peak_gate_models,
-        local_peak_uplift_models=local_peak_uplift_models,
-        local_peak_uplift_caps=local_peak_uplift_caps,
+        local_tail_models=local_tail_models,
+        local_gate_models=local_gate_models,
         feature_cols=local_feature_cols,
         cat_cols=cat_cols,
         local_target_is_residual=local_residual_modeling,
         local_uses_global_pred_feature=include_global_pred_in_local,
         target_transform_state=t_state,
-        use_side_size_modeling=use_side_size_modeling,
-        side_size_min_rows=side_size_min_rows,
-        use_peak_head=use_peak_head,
-        peak_label_quantile=peak_label_quantile,
-        peak_hour_min_rows=peak_hour_min_rows,
-        peak_min_rows=peak_min_rows,
-        peak_gate_threshold=peak_gate_threshold,
-        peak_blend_mode=peak_blend_mode,
-        peak_uplift_positive_only=peak_uplift_positive_only,
-        peak_uplift_cap_quantile=peak_uplift_cap_quantile,
+        use_tail_experts=use_tail_experts,
+        tail_label_mode=tail_label_mode,
+        tail_quantile_upper=tail_quantile_upper,
+        tail_quantile_lower=tail_quantile_lower,
+        tail_gate_threshold=tail_gate_threshold,
+        tail_blend_mode=tail_blend_mode,
+        tail_delta_clip=tail_delta_clip,
+        tail_model_mode=tail_model_mode,
+        tail_weight=tail_weight,
+        tail_min_rows=tail_min_rows,
     )
 
 
@@ -1310,6 +1166,7 @@ def build_feature_table(
     use_temporal_regime: bool = False,
     use_volatility_regime: bool = False,
     use_wind_proxy: bool = False,
+    use_ws80_turbine_features: bool = False,
     use_anomaly_features: bool = True,
     use_cross_market_rank_features: bool = True,
     use_peak_interactions: bool = True,
@@ -1324,7 +1181,11 @@ def build_feature_table(
         all_df = add_anomaly_features(all_df)
     if use_volatility_regime:
         all_df = add_volatility_regime_features(all_df)
-    all_df = add_meteo_features(all_df, use_peak_interactions=use_peak_interactions)
+    all_df = add_meteo_features(
+        all_df,
+        use_peak_interactions=use_peak_interactions,
+        use_ws80_turbine_features=use_ws80_turbine_features,
+    )
     if use_wind_proxy:
         all_df = add_wind_proxy_features(all_df)
     all_df = add_cross_market_features(all_df, use_rank_features=use_cross_market_rank_features)
@@ -1343,13 +1204,13 @@ def build_feature_table(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Slim per-market intraday training with conservative defaults to reduce overfitting."
+        description="Commit-baseline per-market training (2c02eb6 defaults) with optional extras behind CLI toggles."
     )
     parser.add_argument("--train-path", default="data/train.csv")
     parser.add_argument("--test-path", default="data/test_for_participants.csv")
     parser.add_argument("--sample-submission", default="data/sample_submission.csv")
     parser.add_argument("--out-dir", default="runs")
-    parser.add_argument("--name", default="per_market_interactions_slim")
+    parser.add_argument("--name", default="per_market_interactions_commit_baseline")
     parser.add_argument("--exclude-2023", action="store_true")
     parser.add_argument("--exclude-2023-keep-from-month", type=int, default=10)
     parser.add_argument("--cv", action="store_true")
@@ -1382,6 +1243,12 @@ def main() -> None:
         help="Enable wind proxy model-derived features (default: disabled).",
     )
     parser.add_argument(
+        "--use-ws80-turbine-features",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable extra ws80 piecewise turbine proxy features (default: disabled).",
+    )
+    parser.add_argument(
         "--use-anomaly-features",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1402,14 +1269,14 @@ def main() -> None:
     parser.add_argument(
         "--local-residual-modeling",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Train local market models on residuals (target-global_pred) and add back global prediction (default: enabled).",
+        default=False,
+        help="Train local market models on residuals (target-global_pred) and add back global prediction (default: disabled).",
     )
     parser.add_argument(
         "--include-global-pred-in-local",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Include global_pred_feature as local-model input feature (default: disabled).",
+        default=True,
+        help="Include global_pred_feature as local-model input feature (default: enabled).",
     )
     parser.add_argument(
         "--loss-function",
@@ -1420,145 +1287,73 @@ def main() -> None:
     parser.add_argument(
         "--target-transform",
         choices=["none", "signed_log", "log_shift", "yeo_johnson"],
-        default="signed_log",
-        help="Transform target before training and invert predictions before evaluation/submission (default: signed_log).",
+        default="none",
+        help="Transform target before training and invert predictions before evaluation/submission (default: none).",
     )
     parser.add_argument(
-        "--global-iterations",
-        type=int,
-        default=1200,
-        help="Global model iterations (default: 1200).",
-    )
-    parser.add_argument(
-        "--global-learning-rate",
-        type=float,
-        default=0.03,
-        help="Global model learning rate (default: 0.03).",
-    )
-    parser.add_argument(
-        "--global-depth",
-        type=int,
-        default=6,
-        help="Global model tree depth (default: 6).",
-    )
-    parser.add_argument(
-        "--global-l2-leaf-reg",
-        type=float,
-        default=45.0,
-        help="Global model L2 leaf regularization (default: 45.0).",
-    )
-    parser.add_argument(
-        "--global-bagging-temperature",
-        type=float,
-        default=1.0,
-        help="Global model bagging temperature (default: 1.0).",
-    )
-    parser.add_argument(
-        "--global-random-strength",
-        type=float,
-        default=1.4,
-        help="Global model random strength (default: 1.4).",
-    )
-    parser.add_argument(
-        "--local-iterations",
-        type=int,
-        default=1400,
-        help="Local model iterations (default: 1400).",
-    )
-    parser.add_argument(
-        "--local-learning-rate",
-        type=float,
-        default=0.03,
-        help="Local model learning rate (default: 0.03).",
-    )
-    parser.add_argument(
-        "--local-depth",
-        type=int,
-        default=6,
-        help="Local model tree depth (default: 6).",
-    )
-    parser.add_argument(
-        "--local-l2-leaf-reg",
-        type=float,
-        default=50.0,
-        help="Local model L2 leaf regularization (default: 50.0).",
-    )
-    parser.add_argument(
-        "--local-bagging-temperature",
-        type=float,
-        default=1.0,
-        help="Local model bagging temperature (default: 1.0).",
-    )
-    parser.add_argument(
-        "--local-random-strength",
-        type=float,
-        default=1.3,
-        help="Local model random strength (default: 1.3).",
-    )
-    parser.add_argument(
-        "--use-side-size-modeling",
+        "--use-tail-experts",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Enable local side/size decomposition: P(negative) + positive-size + negative-size models (default: disabled).",
+        help="Enable local mixture-of-experts with a tail gate and tail regressor (default: disabled).",
     )
     parser.add_argument(
-        "--side-size-min-rows",
-        type=int,
-        default=240,
-        help="Minimum positive and negative rows per market required to fit side/size local models (default: 240).",
+        "--tail-label-mode",
+        choices=["upper", "two_sided"],
+        default="upper",
+        help="Tail event definition per market for the gate model.",
     )
     parser.add_argument(
-        "--use-peak-head",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable per-market peak gate + uplift head on top of local predictions (default: disabled).",
-    )
-    parser.add_argument(
-        "--peak-label-quantile",
+        "--tail-quantile-upper",
         type=float,
         default=0.99,
-        help="Peak label quantile per market-hour used for gate labels (default: 0.99).",
+        help="Upper quantile per market used to define tail events (default: 0.99).",
     )
     parser.add_argument(
-        "--peak-hour-min-rows",
-        type=int,
-        default=96,
-        help="Min rows per hour in a market to use hour-specific quantile; otherwise fallback to market quantile.",
-    )
-    parser.add_argument(
-        "--peak-min-rows",
-        type=int,
-        default=80,
-        help="Minimum labeled peak rows per market to train peak gate/uplift models.",
-    )
-    parser.add_argument(
-        "--peak-gate-threshold",
+        "--tail-quantile-lower",
         type=float,
-        default=0.75,
-        help="Peak gate threshold for activating uplift (default: 0.75).",
+        default=0.01,
+        help="Lower quantile per market used when --tail-label-mode=two_sided (default: 0.01).",
     )
     parser.add_argument(
-        "--peak-blend-mode",
+        "--tail-model-mode",
+        choices=["tail_only", "weighted_all"],
+        default="tail_only",
+        help="How to train the tail expert: on tail subset only or all rows with tail upweights.",
+    )
+    parser.add_argument(
+        "--tail-weight",
+        type=float,
+        default=6.0,
+        help="Tail sample weight when --tail-model-mode=weighted_all (default: 6.0).",
+    )
+    parser.add_argument(
+        "--tail-min-rows",
+        type=int,
+        default=120,
+        help="Minimum tail rows in a market to train tail gate/expert (default: 120).",
+    )
+    parser.add_argument(
+        "--tail-gate-threshold",
+        type=float,
+        default=0.95,
+        help="High-precision gate threshold for tail activation (default: 0.95).",
+    )
+    parser.add_argument(
+        "--tail-blend-mode",
         choices=["soft", "hard"],
         default="soft",
-        help="Peak uplift blending: soft probability weighting or hard switch.",
+        help="Tail blending rule: probability-weighted soft blend or hard switch.",
     )
     parser.add_argument(
-        "--peak-uplift-positive-only",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Constrain peak uplift to non-negative adjustments only (default: enabled).",
-    )
-    parser.add_argument(
-        "--peak-uplift-cap-quantile",
+        "--tail-delta-clip",
         type=float,
-        default=0.995,
-        help="Quantile for per-market uplift cap to reduce false extreme spikes.",
+        default=250.0,
+        help="Optional cap on tail minus normal adjustment in transformed space (<=0 disables clip).",
     )
     parser.add_argument(
         "--recover-base-2c02eb6",
         action="store_true",
-        help="Force legacy baseline behavior matching commit 2c02eb6 as closely as possible.",
+        help="Force commit 2c02eb6 baseline toggles, regardless of other feature flags.",
     )
     parser.add_argument(
         "--save-models",
@@ -1590,27 +1385,51 @@ def main() -> None:
         args.use_temporal_regime = False
         args.use_volatility_regime = False
         args.use_wind_proxy = False
+        args.use_ws80_turbine_features = False
         args.use_anomaly_features = False
         args.use_cross_market_rank_features = False
         args.use_peak_interactions = False
         args.local_residual_modeling = False
         args.include_global_pred_in_local = True
         args.target_transform = "none"
-        args.use_side_size_modeling = False
-        args.use_peak_head = False
-        args.global_iterations = 2500
-        args.global_learning_rate = 0.03
-        args.global_depth = 8
-        args.global_l2_leaf_reg = 18.0
-        args.global_bagging_temperature = 0.5
-        args.global_random_strength = 1.0
-        args.local_iterations = 3000
-        args.local_learning_rate = 0.025
-        args.local_depth = 8
-        args.local_l2_leaf_reg = 20.0
-        args.local_bagging_temperature = 0.4
-        args.local_random_strength = 0.9
-        print("Applied legacy recovery preset: 2c02eb6")
+        args.use_tail_experts = False
+        args.loss_function = "RMSE"
+        print("Applied commit baseline preset: 2c02eb6")
+
+    non_baseline_flags: list[str] = []
+    if args.use_dynamic_target_profiles:
+        non_baseline_flags.append("use_dynamic_target_profiles")
+    if args.use_temporal_regime:
+        non_baseline_flags.append("use_temporal_regime")
+    if args.use_volatility_regime:
+        non_baseline_flags.append("use_volatility_regime")
+    if args.use_wind_proxy:
+        non_baseline_flags.append("use_wind_proxy")
+    if args.use_ws80_turbine_features:
+        non_baseline_flags.append("use_ws80_turbine_features")
+    if args.use_anomaly_features:
+        non_baseline_flags.append("use_anomaly_features")
+    if args.use_cross_market_rank_features:
+        non_baseline_flags.append("use_cross_market_rank_features")
+    if args.use_peak_interactions:
+        non_baseline_flags.append("use_peak_interactions")
+    if args.local_residual_modeling:
+        non_baseline_flags.append("local_residual_modeling")
+    if not args.include_global_pred_in_local:
+        non_baseline_flags.append("no_include_global_pred_in_local")
+    if args.target_transform != "none":
+        non_baseline_flags.append(f"target_transform={args.target_transform}")
+    if args.loss_function != "RMSE":
+        non_baseline_flags.append(f"loss_function={args.loss_function}")
+    if args.use_tail_experts:
+        non_baseline_flags.append("use_tail_experts")
+
+    if non_baseline_flags:
+        print("Non-baseline toggles enabled: " + ", ".join(non_baseline_flags))
+    else:
+        print("Running strict commit baseline defaults (2c02eb6-equivalent path).")
+
+    tail_delta_clip = args.tail_delta_clip if args.tail_delta_clip > 0 else None
 
     train_df = pd.read_csv(args.train_path)
     test_df = pd.read_csv(args.test_path)
@@ -1633,6 +1452,7 @@ def main() -> None:
             use_temporal_regime=args.use_temporal_regime,
             use_volatility_regime=args.use_volatility_regime,
             use_wind_proxy=args.use_wind_proxy,
+            use_ws80_turbine_features=args.use_ws80_turbine_features,
             use_anomaly_features=args.use_anomaly_features,
             use_cross_market_rank_features=args.use_cross_market_rank_features,
             use_peak_interactions=args.use_peak_interactions,
@@ -1640,28 +1460,16 @@ def main() -> None:
             include_global_pred_in_local=args.include_global_pred_in_local,
             loss_function=args.loss_function,
             target_transform=args.target_transform,
-            global_iterations=args.global_iterations,
-            global_learning_rate=args.global_learning_rate,
-            global_depth=args.global_depth,
-            global_l2_leaf_reg=args.global_l2_leaf_reg,
-            global_bagging_temperature=args.global_bagging_temperature,
-            global_random_strength=args.global_random_strength,
-            local_iterations=args.local_iterations,
-            local_learning_rate=args.local_learning_rate,
-            local_depth=args.local_depth,
-            local_l2_leaf_reg=args.local_l2_leaf_reg,
-            local_bagging_temperature=args.local_bagging_temperature,
-            local_random_strength=args.local_random_strength,
-            use_side_size_modeling=args.use_side_size_modeling,
-            side_size_min_rows=args.side_size_min_rows,
-            use_peak_head=args.use_peak_head,
-            peak_label_quantile=args.peak_label_quantile,
-            peak_hour_min_rows=args.peak_hour_min_rows,
-            peak_min_rows=args.peak_min_rows,
-            peak_gate_threshold=args.peak_gate_threshold,
-            peak_blend_mode=args.peak_blend_mode,
-            peak_uplift_positive_only=args.peak_uplift_positive_only,
-            peak_uplift_cap_quantile=args.peak_uplift_cap_quantile,
+            use_tail_experts=args.use_tail_experts,
+            tail_label_mode=args.tail_label_mode,
+            tail_quantile_upper=args.tail_quantile_upper,
+            tail_quantile_lower=args.tail_quantile_lower,
+            tail_model_mode=args.tail_model_mode,
+            tail_weight=args.tail_weight,
+            tail_min_rows=args.tail_min_rows,
+            tail_gate_threshold=args.tail_gate_threshold,
+            tail_blend_mode=args.tail_blend_mode,
+            tail_delta_clip=tail_delta_clip,
         )
 
     train_feat, test_feat = build_feature_table(
@@ -1671,6 +1479,7 @@ def main() -> None:
         use_temporal_regime=args.use_temporal_regime,
         use_volatility_regime=args.use_volatility_regime,
         use_wind_proxy=args.use_wind_proxy,
+        use_ws80_turbine_features=args.use_ws80_turbine_features,
         use_anomaly_features=args.use_anomaly_features,
         use_cross_market_rank_features=args.use_cross_market_rank_features,
         use_peak_interactions=args.use_peak_interactions,
@@ -1693,28 +1502,16 @@ def main() -> None:
         include_global_pred_in_local=args.include_global_pred_in_local,
         loss_function=args.loss_function,
         target_transform=args.target_transform,
-        global_iterations=args.global_iterations,
-        global_learning_rate=args.global_learning_rate,
-        global_depth=args.global_depth,
-        global_l2_leaf_reg=args.global_l2_leaf_reg,
-        global_bagging_temperature=args.global_bagging_temperature,
-        global_random_strength=args.global_random_strength,
-        local_iterations=args.local_iterations,
-        local_learning_rate=args.local_learning_rate,
-        local_depth=args.local_depth,
-        local_l2_leaf_reg=args.local_l2_leaf_reg,
-        local_bagging_temperature=args.local_bagging_temperature,
-        local_random_strength=args.local_random_strength,
-        use_side_size_modeling=args.use_side_size_modeling,
-        side_size_min_rows=args.side_size_min_rows,
-        use_peak_head=args.use_peak_head,
-        peak_label_quantile=args.peak_label_quantile,
-        peak_hour_min_rows=args.peak_hour_min_rows,
-        peak_min_rows=args.peak_min_rows,
-        peak_gate_threshold=args.peak_gate_threshold,
-        peak_blend_mode=args.peak_blend_mode,
-        peak_uplift_positive_only=args.peak_uplift_positive_only,
-        peak_uplift_cap_quantile=args.peak_uplift_cap_quantile,
+        use_tail_experts=args.use_tail_experts,
+        tail_label_mode=args.tail_label_mode,
+        tail_quantile_upper=args.tail_quantile_upper,
+        tail_quantile_lower=args.tail_quantile_lower,
+        tail_model_mode=args.tail_model_mode,
+        tail_weight=args.tail_weight,
+        tail_min_rows=args.tail_min_rows,
+        tail_gate_threshold=args.tail_gate_threshold,
+        tail_blend_mode=args.tail_blend_mode,
+        tail_delta_clip=tail_delta_clip,
     )
 
     # Add global prediction feature to test and run local market experts.
@@ -1728,7 +1525,7 @@ def main() -> None:
             # Fallback to global if market-specific model doesn't exist.
             pred[idx] = test_feat.loc[idx, "global_pred_feature"].to_numpy(dtype=float)
             continue
-        local_pred = _predict_local_side_size(
+        local_pred = _predict_local_expert(
             artifacts=artifacts,
             market=str(market),
             X=test_feat.loc[idx],
@@ -1755,7 +1552,7 @@ def main() -> None:
     sub_path = run_dir / "submission.csv"
     out_sub.to_csv(sub_path, index=False)
 
-    latest_path = Path("submission_per_market_interactions_slim.csv")
+    latest_path = Path("submission_per_market_interactions_commit_baseline.csv")
     out_sub.to_csv(latest_path, index=False)
 
     print(f"Saved submission: {sub_path}")
@@ -1765,26 +1562,22 @@ def main() -> None:
     print(f"Markets modeled: {sorted(artifacts.local_models.keys())}")
     print(f"Local target is residual: {artifacts.local_target_is_residual}")
     print(f"Local uses global_pred_feature: {artifacts.local_uses_global_pred_feature}")
-    print(f"Side/size modeling enabled: {artifacts.use_side_size_modeling}")
-    if artifacts.use_side_size_modeling:
-        print(f"Side/size min rows per side: {artifacts.side_size_min_rows}")
-        print(f"Side models trained: {len(artifacts.local_side_models)}")
-        print(f"Positive-size models trained: {len(artifacts.local_pos_size_models)}")
-        print(f"Negative-size models trained: {len(artifacts.local_neg_size_models)}")
-    print(f"Peak head enabled: {artifacts.use_peak_head}")
-    if artifacts.use_peak_head:
+    print(f"Tail experts enabled: {artifacts.use_tail_experts}")
+    if artifacts.use_tail_experts:
         print(
-            "Peak head settings: "
-            f"q={artifacts.peak_label_quantile}, "
-            f"hour_min_rows={artifacts.peak_hour_min_rows}, "
-            f"peak_min_rows={artifacts.peak_min_rows}, "
-            f"gate_tau={artifacts.peak_gate_threshold}, "
-            f"blend={artifacts.peak_blend_mode}, "
-            f"uplift_positive_only={artifacts.peak_uplift_positive_only}, "
-            f"uplift_cap_q={artifacts.peak_uplift_cap_quantile}"
+            "Tail expert settings: "
+            f"label_mode={artifacts.tail_label_mode}, "
+            f"q_upper={artifacts.tail_quantile_upper}, "
+            f"q_lower={artifacts.tail_quantile_lower}, "
+            f"gate_tau={artifacts.tail_gate_threshold}, "
+            f"blend={artifacts.tail_blend_mode}, "
+            f"delta_clip={artifacts.tail_delta_clip}, "
+            f"mode={artifacts.tail_model_mode}, "
+            f"tail_weight={artifacts.tail_weight}, "
+            f"tail_min_rows={artifacts.tail_min_rows}"
         )
-        print(f"Peak gate models trained: {len(artifacts.local_peak_gate_models)}")
-        print(f"Peak uplift models trained: {len(artifacts.local_peak_uplift_models)}")
+        print(f"Tail models trained: {len(artifacts.local_tail_models)}")
+        print(f"Gate models trained: {len(artifacts.local_gate_models)}")
     print(f"Target transform: {artifacts.target_transform_state.to_metadata()}")
     print(f"CV RMSE: {cv_rmse}")
     if not cv_details.empty:
@@ -1810,67 +1603,40 @@ def main() -> None:
             model.save_model(local_path)
             local_model_paths[str(market)] = str(local_path.name)
 
-        local_side_model_paths: dict[str, str] = {}
-        for market, model in artifacts.local_side_models.items():
+        local_tail_model_paths: dict[str, str] = {}
+        for market, model in artifacts.local_tail_models.items():
             safe_market = str(market).replace(" ", "_")
-            local_path = models_dir / f"local_side_model_{safe_market}.cbm"
+            local_path = models_dir / f"local_tail_model_{safe_market}.cbm"
             model.save_model(local_path)
-            local_side_model_paths[str(market)] = str(local_path.name)
+            local_tail_model_paths[str(market)] = str(local_path.name)
 
-        local_pos_size_model_paths: dict[str, str] = {}
-        for market, model in artifacts.local_pos_size_models.items():
+        local_gate_model_paths: dict[str, str] = {}
+        for market, model in artifacts.local_gate_models.items():
             safe_market = str(market).replace(" ", "_")
-            local_path = models_dir / f"local_pos_size_model_{safe_market}.cbm"
+            local_path = models_dir / f"local_gate_model_{safe_market}.cbm"
             model.save_model(local_path)
-            local_pos_size_model_paths[str(market)] = str(local_path.name)
-
-        local_neg_size_model_paths: dict[str, str] = {}
-        for market, model in artifacts.local_neg_size_models.items():
-            safe_market = str(market).replace(" ", "_")
-            local_path = models_dir / f"local_neg_size_model_{safe_market}.cbm"
-            model.save_model(local_path)
-            local_neg_size_model_paths[str(market)] = str(local_path.name)
-
-        local_peak_gate_model_paths: dict[str, str] = {}
-        for market, model in artifacts.local_peak_gate_models.items():
-            safe_market = str(market).replace(" ", "_")
-            local_path = models_dir / f"local_peak_gate_model_{safe_market}.cbm"
-            model.save_model(local_path)
-            local_peak_gate_model_paths[str(market)] = str(local_path.name)
-
-        local_peak_uplift_model_paths: dict[str, str] = {}
-        for market, model in artifacts.local_peak_uplift_models.items():
-            safe_market = str(market).replace(" ", "_")
-            local_path = models_dir / f"local_peak_uplift_model_{safe_market}.cbm"
-            model.save_model(local_path)
-            local_peak_uplift_model_paths[str(market)] = str(local_path.name)
+            local_gate_model_paths[str(market)] = str(local_path.name)
 
         model_meta = {
             "global_model": str(global_model_path.name),
             "local_models": local_model_paths,
-            "local_side_models": local_side_model_paths,
-            "local_pos_size_models": local_pos_size_model_paths,
-            "local_neg_size_models": local_neg_size_model_paths,
-            "local_peak_gate_models": local_peak_gate_model_paths,
-            "local_peak_uplift_models": local_peak_uplift_model_paths,
-            "local_peak_uplift_caps": artifacts.local_peak_uplift_caps,
+            "local_tail_models": local_tail_model_paths,
+            "local_gate_models": local_gate_model_paths,
             "feature_cols": artifacts.feature_cols,
             "cat_cols": artifacts.cat_cols,
             "local_target_is_residual": artifacts.local_target_is_residual,
             "local_uses_global_pred_feature": artifacts.local_uses_global_pred_feature,
-            "side_size_config": {
-                "use_side_size_modeling": artifacts.use_side_size_modeling,
-                "side_size_min_rows": artifacts.side_size_min_rows,
-            },
-            "peak_head_config": {
-                "use_peak_head": artifacts.use_peak_head,
-                "peak_label_quantile": artifacts.peak_label_quantile,
-                "peak_hour_min_rows": artifacts.peak_hour_min_rows,
-                "peak_min_rows": artifacts.peak_min_rows,
-                "peak_gate_threshold": artifacts.peak_gate_threshold,
-                "peak_blend_mode": artifacts.peak_blend_mode,
-                "peak_uplift_positive_only": artifacts.peak_uplift_positive_only,
-                "peak_uplift_cap_quantile": artifacts.peak_uplift_cap_quantile,
+            "tail_expert_config": {
+                "use_tail_experts": artifacts.use_tail_experts,
+                "tail_label_mode": artifacts.tail_label_mode,
+                "tail_quantile_upper": artifacts.tail_quantile_upper,
+                "tail_quantile_lower": artifacts.tail_quantile_lower,
+                "tail_gate_threshold": artifacts.tail_gate_threshold,
+                "tail_blend_mode": artifacts.tail_blend_mode,
+                "tail_delta_clip": artifacts.tail_delta_clip,
+                "tail_model_mode": artifacts.tail_model_mode,
+                "tail_weight": artifacts.tail_weight,
+                "tail_min_rows": artifacts.tail_min_rows,
             },
             "target_transform": artifacts.target_transform_state.to_metadata(),
             "candidate_features_before_global_pred": candidate_features,
@@ -1883,10 +1649,10 @@ def main() -> None:
         print(f"Saved model metadata: {model_meta_path}")
 
         if args.save_shap:
-            if artifacts.use_side_size_modeling or artifacts.use_peak_head:
+            if artifacts.use_tail_experts:
                 print(
                     "Note: SHAP export uses saved normal experts for local attributions; "
-                    "side/size and peak-head decomposition are not decomposed in the SHAP output."
+                    "gate/tail blending logic is not decomposed in the SHAP output."
                 )
             shap_cmd = [
                 Path(__file__).with_name("shap_from_saved_models.py").as_posix(),

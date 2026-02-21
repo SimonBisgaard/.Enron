@@ -17,6 +17,31 @@ from catboost import CatBoostRegressor, Pool
 from sklearn.metrics import mean_squared_error
 
 
+REDUNDANT_FEATURE_DROP_LIST = [
+    # Forecast/residual x-market means duplicate base forecasts in this dataset.
+    "load_forecast_xmk_mean",
+    "wind_forecast_xmk_mean",
+    "solar_forecast_xmk_mean",
+    "residual_load_xmk_mean",
+    # These x-market std features are constant zero.
+    "load_forecast_xmk_std",
+    "wind_forecast_xmk_std",
+    "solar_forecast_xmk_std",
+    "residual_load_xmk_std",
+    # These collapse to near-zero noise-only values for global forecasts.
+    "load_forecast_xmk_diff",
+    "wind_forecast_xmk_diff",
+    "solar_forecast_xmk_diff",
+    "residual_load_xmk_diff",
+    "load_forecast_xmk_z",
+    "wind_forecast_xmk_z",
+    "solar_forecast_xmk_z",
+    "residual_load_xmk_z",
+    # Exact duplicate indicator.
+    "is_evening_peak",
+]
+
+
 def _to_datetime_col(df: pd.DataFrame, col: str) -> pd.Series:
     out = pd.to_datetime(df[col], errors="coerce")
     if out.isna().any():
@@ -117,6 +142,60 @@ def add_meteo_features(df: pd.DataFrame) -> pd.DataFrame:
         out["wind80_x_residual_load"] = out["wind_speed_80m"] * out["residual_load"]
     if {"cloud_cover_total", "solar_forecast"}.issubset(out.columns):
         out["cloud_x_solar"] = out["cloud_cover_total"] * out["solar_forecast"]
+
+    return out
+
+
+def add_temperature_demand_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "air_temperature_2m" not in out.columns:
+        return out
+
+    temp = out["air_temperature_2m"]
+    out["hdd_18"] = (18.0 - temp).clip(lower=0.0)
+    out["cdd_22"] = (temp - 22.0).clip(lower=0.0)
+    out["temp_extreme_mag"] = out["hdd_18"] + out["cdd_22"]
+    out["temp_extreme_flag"] = ((temp <= 2.0) | (temp >= 28.0)).astype(int)
+    return out
+
+
+def add_physics_regime_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    if "wind_speed_80m" in out.columns:
+        out["wind_speed_80m_cubed"] = out["wind_speed_80m"] ** 3
+        if {"market", "delivery_start"}.issubset(out.columns):
+            tmp = out[["market", "delivery_start", "wind_speed_80m"]].copy()
+            tmp["_row_id"] = np.arange(len(tmp))
+            tmp = tmp.sort_values(["market", "delivery_start", "_row_id"])
+            g_ws = tmp.groupby("market")["wind_speed_80m"]
+            tmp["wind_ramp_proxy"] = tmp["wind_speed_80m"] - g_ws.shift(1)
+            tmp = tmp.sort_values("_row_id")
+            out["wind_ramp_proxy"] = tmp["wind_ramp_proxy"].to_numpy(dtype=float)
+
+    if "residual_load_diff_6" in out.columns:
+        out["residual_load_ramp_abs_6"] = out["residual_load_diff_6"].abs()
+    if "residual_load_diff_24" in out.columns:
+        out["residual_load_ramp_abs_24"] = out["residual_load_diff_24"].abs()
+
+    if {"diffuse_horizontal_irradiance", "direct_normal_irradiance"}.issubset(out.columns):
+        out["cloud_regime_ratio"] = out["diffuse_horizontal_irradiance"] / (
+            out["direct_normal_irradiance"] + 1e-6
+        )
+    if {
+        "global_horizontal_irradiance",
+        "direct_normal_irradiance",
+        "diffuse_horizontal_irradiance",
+    }.issubset(out.columns):
+        out["clear_sky_error_proxy"] = out["global_horizontal_irradiance"] - (
+            out["direct_normal_irradiance"] + out["diffuse_horizontal_irradiance"]
+        )
+
+    if "air_temperature_2m" in out.columns:
+        out["temp_gap_18"] = (out["air_temperature_2m"] - 18.0).abs()
+
+    if {"cape", "convective_inhibition"}.issubset(out.columns):
+        out["storm_score"] = out["cape"] / (1.0 + out["convective_inhibition"].abs())
 
     return out
 
@@ -288,6 +367,19 @@ def _make_local_model() -> CatBoostRegressor:
         random_seed=42,
         verbose=0,
     )
+
+
+def maybe_drop_redundant_features(
+    feature_cols: list[str],
+    *,
+    enabled: bool,
+) -> tuple[list[str], list[str]]:
+    if not enabled:
+        return feature_cols, []
+    drop_set = set(REDUNDANT_FEATURE_DROP_LIST)
+    kept = [c for c in feature_cols if c not in drop_set]
+    dropped = [c for c in feature_cols if c in drop_set]
+    return kept, dropped
 
 
 def _yaml_scalar(v: Any) -> str:
@@ -625,6 +717,9 @@ def run_time_series_cv(
     residual_oof_val_days: int,
     residual_oof_step_days: int,
     residual_oof_min_train_days: int,
+    add_temperature_demand: bool,
+    add_physics_regime: bool,
+    drop_redundant_features: bool,
 ) -> tuple[float | None, pd.DataFrame, pd.DataFrame]:
     folds = make_time_series_folds(
         train_df=train_df_raw,
@@ -661,10 +756,21 @@ def run_time_series_cv(
             f"val_range=[{val_start.date()} -> {val_end.date()})"
         )
 
-        tr_feat, va_feat = build_feature_table(tr, va.drop(columns=["target"]).copy())
+        tr_feat, va_feat = build_feature_table(
+            tr,
+            va.drop(columns=["target"]).copy(),
+            add_temperature_demand=add_temperature_demand,
+            add_physics_regime=add_physics_regime,
+        )
 
         base_drop = {"id", "target", "delivery_start", "delivery_end"}
         feat_cols = [c for c in tr_feat.columns if c not in base_drop]
+        feat_cols, dropped_cols = maybe_drop_redundant_features(
+            feat_cols,
+            enabled=drop_redundant_features,
+        )
+        if dropped_cols:
+            print(f"CV fold {fold_idx}: dropped {len(dropped_cols)} redundant features")
         cat_cols = [
             c
             for c in ["market", "hour_x_market", "dow_x_market", "month_x_market"]
@@ -808,12 +914,22 @@ def train_global_and_local_models(
     )
 
 
-def build_feature_table(train_df: pd.DataFrame, test_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def build_feature_table(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    *,
+    add_temperature_demand: bool = False,
+    add_physics_regime: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     all_df = pd.concat([train_df.assign(_is_train=1), test_df.assign(_is_train=0)], axis=0, ignore_index=True)
     all_df = add_time_features(all_df)
     all_df = add_forecast_core_features(all_df)
     all_df = add_forecast_lag_features(all_df)
     all_df = add_meteo_features(all_df)
+    if add_temperature_demand:
+        all_df = add_temperature_demand_features(all_df)
+    if add_physics_regime:
+        all_df = add_physics_regime_features(all_df)
     all_df = add_cross_market_features(all_df)
     all_df = add_missingness_features(all_df)
     all_df = add_market_categorical_interactions(all_df)
@@ -838,6 +954,24 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Restrict training rows to delivery_start >= 2023-10-01 (default: disabled).",
+    )
+    parser.add_argument(
+        "--add-temperature-demand-features",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add temperature-demand features (hdd_18, cdd_22, temp_extreme_mag, temp_extreme_flag) (default: disabled).",
+    )
+    parser.add_argument(
+        "--add-physics-regime-features",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add wind/ramp/cloud/temp/storm regime features (default: disabled).",
+    )
+    parser.add_argument(
+        "--drop-redundant-features",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Drop conservative duplicate/constant feature set (default: disabled).",
     )
     parser.add_argument("--cv", action="store_true")
     parser.add_argument("--cv-folds", type=int, default=5)
@@ -936,13 +1070,28 @@ def main() -> None:
             residual_oof_val_days=args.residual_oof_val_days,
             residual_oof_step_days=args.residual_oof_step_days,
             residual_oof_min_train_days=args.residual_oof_min_train_days,
+            add_temperature_demand=args.add_temperature_demand_features,
+            add_physics_regime=args.add_physics_regime_features,
+            drop_redundant_features=args.drop_redundant_features,
         )
 
-    train_feat, test_feat = build_feature_table(train_df, test_df)
+    train_feat, test_feat = build_feature_table(
+        train_df,
+        test_df,
+        add_temperature_demand=args.add_temperature_demand_features,
+        add_physics_regime=args.add_physics_regime_features,
+    )
     test_with_key = test_feat[["id", "market"]].copy()
 
     base_drop = {"id", "target", "delivery_start", "delivery_end"}
     candidate_features = [c for c in train_feat.columns if c not in base_drop]
+    candidate_features, dropped_cols_main = maybe_drop_redundant_features(
+        candidate_features,
+        enabled=args.drop_redundant_features,
+    )
+    if dropped_cols_main:
+        print(f"Dropped {len(dropped_cols_main)} redundant features in main fit path.")
+        print(f"Dropped features: {sorted(dropped_cols_main)}")
     cat_cols = [
         c
         for c in ["market", "hour_x_market", "dow_x_market", "month_x_market"]

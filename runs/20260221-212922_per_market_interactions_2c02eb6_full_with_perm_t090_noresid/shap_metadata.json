@@ -1,0 +1,8 @@
+{
+  "run_dir": "runs/20260221-212922_per_market_interactions_2c02eb6_full_with_perm_t090_noresid",
+  "global_sample_size_used": 1500,
+  "per_market_sample_size_requested": 400,
+  "rows_train": 132608,
+  "global_feature_count": 167,
+  "local_feature_count": 168
+}

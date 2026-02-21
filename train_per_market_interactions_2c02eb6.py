@@ -233,16 +233,61 @@ def apply_exclude_2023(df: pd.DataFrame, keep_from_month: int = 10) -> pd.DataFr
     return out.loc[keep_mask].copy()
 
 
+def apply_train_start_cutoff(df: pd.DataFrame, start_date: str) -> pd.DataFrame:
+    out = df.copy()
+    start = _to_datetime_col(out, "delivery_start")
+    cutoff = pd.Timestamp(start_date)
+    keep_mask = start >= cutoff
+    removed = int((~keep_mask).sum())
+    kept = int(keep_mask.sum())
+    print(
+        "Train start cutoff mode: "
+        f"start_date={cutoff.date()}, removed={removed}, kept={kept}"
+    )
+    return out.loc[keep_mask].copy()
+
+
 @dataclass
 class TrainArtifacts:
     global_model: CatBoostRegressor
     local_models: dict[str, CatBoostRegressor]
     feature_cols: list[str]
     cat_cols: list[str]
+    local_target_is_residual: bool
 
 
 def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+def _make_global_model() -> CatBoostRegressor:
+    return CatBoostRegressor(
+        loss_function="RMSE",
+        eval_metric="RMSE",
+        iterations=2500,
+        learning_rate=0.03,
+        depth=8,
+        l2_leaf_reg=18.0,
+        bagging_temperature=0.5,
+        random_strength=1.0,
+        random_seed=42,
+        verbose=0,
+    )
+
+
+def _make_local_model() -> CatBoostRegressor:
+    return CatBoostRegressor(
+        loss_function="RMSE",
+        eval_metric="RMSE",
+        iterations=3000,
+        learning_rate=0.025,
+        depth=8,
+        l2_leaf_reg=20.0,
+        bagging_temperature=0.4,
+        random_strength=0.9,
+        random_seed=42,
+        verbose=0,
+    )
 
 
 def _yaml_scalar(v: Any) -> str:
@@ -486,6 +531,7 @@ def save_repro_artifacts(
         "local_models": model_file_map.get("local_models", {}),
         "feature_cols": artifacts.feature_cols,
         "cat_cols": artifacts.cat_cols,
+        "local_target_is_residual": artifacts.local_target_is_residual,
         "candidate_features_before_global_pred": candidate_features,
         "cv_rmse": cv_rmse,
         "train_args": vars(args),
@@ -531,12 +577,54 @@ def make_time_series_folds(
     return folds
 
 
+def compute_global_oof_predictions(
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    cat_cols: list[str],
+    *,
+    n_folds: int,
+    val_days: int,
+    step_days: int,
+    min_train_days: int,
+) -> pd.Series:
+    folds = make_time_series_folds(
+        train_df=train_df,
+        n_folds=n_folds,
+        val_days=val_days,
+        step_days=step_days,
+        min_train_days=min_train_days,
+    )
+    if not folds:
+        return pd.Series(index=train_df.index, dtype=float)
+
+    start_all = _to_datetime_col(train_df, "delivery_start")
+    oof = pd.Series(index=train_df.index, dtype=float)
+    for val_start, val_end in folds:
+        tr_mask = start_all < val_start
+        va_mask = (start_all >= val_start) & (start_all < val_end)
+        tr = train_df.loc[tr_mask]
+        va = train_df.loc[va_mask]
+        if tr.empty or va.empty:
+            continue
+
+        model = _make_global_model()
+        model.fit(tr[feature_cols], tr["target"], cat_features=cat_cols)
+        oof.loc[va.index] = model.predict(va[feature_cols])
+    return oof
+
+
 def run_time_series_cv(
     train_df_raw: pd.DataFrame,
     n_folds: int,
     val_days: int,
     step_days: int,
     min_train_days: int,
+    *,
+    use_residual_stacking: bool,
+    residual_oof_folds: int,
+    residual_oof_val_days: int,
+    residual_oof_step_days: int,
+    residual_oof_min_train_days: int,
 ) -> tuple[float | None, pd.DataFrame, pd.DataFrame]:
     folds = make_time_series_folds(
         train_df=train_df_raw,
@@ -583,7 +671,16 @@ def run_time_series_cv(
             if c in feat_cols
         ]
 
-        artifacts = train_global_and_local_models(tr_feat, feat_cols, cat_cols)
+        artifacts = train_global_and_local_models(
+            tr_feat,
+            feat_cols,
+            cat_cols,
+            use_residual_stacking=use_residual_stacking,
+            residual_oof_folds=residual_oof_folds,
+            residual_oof_val_days=residual_oof_val_days,
+            residual_oof_step_days=residual_oof_step_days,
+            residual_oof_min_train_days=residual_oof_min_train_days,
+        )
         va_feat = va_feat.copy()
         va_feat["global_pred_feature"] = artifacts.global_model.predict(va_feat[feat_cols])
 
@@ -594,7 +691,11 @@ def run_time_series_cv(
             if model is None:
                 pred[idx] = va_feat.loc[idx, "global_pred_feature"].to_numpy(dtype=float)
             else:
-                pred[idx] = model.predict(va_feat.loc[idx, artifacts.feature_cols])
+                local_pred = model.predict(va_feat.loc[idx, artifacts.feature_cols])
+                if artifacts.local_target_is_residual:
+                    pred[idx] = va_feat.loc[idx, "global_pred_feature"].to_numpy(dtype=float) + local_pred
+                else:
+                    pred[idx] = local_pred
         if np.isnan(pred).any():
             raise ValueError(f"NaNs in CV predictions for fold {fold_idx}")
 
@@ -650,39 +751,51 @@ def run_time_series_cv(
     return overall, pd.DataFrame(fold_rows), cv_oof
 
 
-def train_global_and_local_models(train_df: pd.DataFrame, feature_cols: list[str], cat_cols: list[str]) -> TrainArtifacts:
-    global_model = CatBoostRegressor(
-        loss_function="RMSE",
-        eval_metric="RMSE",
-        iterations=2500,
-        learning_rate=0.03,
-        depth=8,
-        l2_leaf_reg=18.0,
-        bagging_temperature=0.5,
-        random_strength=1.0,
-        random_seed=42,
-        verbose=0,
-    )
+def train_global_and_local_models(
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    cat_cols: list[str],
+    *,
+    use_residual_stacking: bool,
+    residual_oof_folds: int,
+    residual_oof_val_days: int,
+    residual_oof_step_days: int,
+    residual_oof_min_train_days: int,
+) -> TrainArtifacts:
+    global_model = _make_global_model()
     global_model.fit(train_df[feature_cols], train_df["target"], cat_features=cat_cols)
     train_df = train_df.copy()
     train_df["global_pred_feature"] = global_model.predict(train_df[feature_cols])
 
     local_feature_cols = feature_cols + ["global_pred_feature"]
+    if use_residual_stacking:
+        oof_global = compute_global_oof_predictions(
+            train_df,
+            feature_cols,
+            cat_cols,
+            n_folds=residual_oof_folds,
+            val_days=residual_oof_val_days,
+            step_days=residual_oof_step_days,
+            min_train_days=residual_oof_min_train_days,
+        )
+        coverage = float(oof_global.notna().mean()) if len(oof_global) > 0 else 0.0
+        if coverage == 0.0:
+            print(
+                "Residual stacking: no OOF global predictions generated; "
+                "falling back to in-sample global predictions for residual target."
+            )
+        train_df["global_pred_oof_feature"] = oof_global.fillna(train_df["global_pred_feature"])
+        print(f"Residual stacking OOF coverage: {coverage:.4%}")
+
     local_models: dict[str, CatBoostRegressor] = {}
     for market, mdf in train_df.groupby("market", dropna=False):
-        model = CatBoostRegressor(
-            loss_function="RMSE",
-            eval_metric="RMSE",
-            iterations=3000,
-            learning_rate=0.025,
-            depth=8,
-            l2_leaf_reg=20.0,
-            bagging_temperature=0.4,
-            random_strength=0.9,
-            random_seed=42,
-            verbose=0,
+        model = _make_local_model()
+        local_target = (
+            mdf["target"] - mdf["global_pred_oof_feature"]
+            if use_residual_stacking
+            else mdf["target"]
         )
-        model.fit(mdf[local_feature_cols], mdf["target"], cat_features=cat_cols)
+        model.fit(mdf[local_feature_cols], local_target, cat_features=cat_cols)
         local_models[str(market)] = model
         print(f"Trained local model for {market} ({len(mdf)} rows)")
 
@@ -691,6 +804,7 @@ def train_global_and_local_models(train_df: pd.DataFrame, feature_cols: list[str
         local_models=local_models,
         feature_cols=local_feature_cols,
         cat_cols=cat_cols,
+        local_target_is_residual=use_residual_stacking,
     )
 
 
@@ -719,11 +833,47 @@ def main() -> None:
     parser.add_argument("--name", default="per_market_interactions")
     parser.add_argument("--exclude-2023", action="store_true")
     parser.add_argument("--exclude-2023-keep-from-month", type=int, default=10)
+    parser.add_argument(
+        "--train-start-oct-2023",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Restrict training rows to delivery_start >= 2023-10-01 (default: disabled).",
+    )
     parser.add_argument("--cv", action="store_true")
     parser.add_argument("--cv-folds", type=int, default=5)
     parser.add_argument("--cv-val-days", type=int, default=14)
     parser.add_argument("--cv-step-days", type=int, default=14)
     parser.add_argument("--cv-min-train-days", type=int, default=90)
+    parser.add_argument(
+        "--use-residual-stacking",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Train local market models on residual target (y - global_pred_oof) and add global prediction at inference (default: disabled).",
+    )
+    parser.add_argument(
+        "--residual-oof-folds",
+        type=int,
+        default=3,
+        help="Inner time-series folds used to build global OOF predictions for residual targets (default: 3).",
+    )
+    parser.add_argument(
+        "--residual-oof-val-days",
+        type=int,
+        default=14,
+        help="Validation window days for residual OOF global predictions (default: 14).",
+    )
+    parser.add_argument(
+        "--residual-oof-step-days",
+        type=int,
+        default=14,
+        help="Step days for residual OOF global predictions (default: 14).",
+    )
+    parser.add_argument(
+        "--residual-oof-min-train-days",
+        type=int,
+        default=90,
+        help="Minimum train days for residual OOF global predictions (default: 90).",
+    )
     parser.add_argument(
         "--save-shap",
         action=argparse.BooleanOptionalAction,
@@ -768,6 +918,8 @@ def main() -> None:
 
     if args.exclude_2023:
         train_df = apply_exclude_2023(train_df, keep_from_month=args.exclude_2023_keep_from_month)
+    if args.train_start_oct_2023:
+        train_df = apply_train_start_cutoff(train_df, start_date="2023-10-01")
 
     cv_rmse = None
     cv_details = pd.DataFrame()
@@ -779,6 +931,11 @@ def main() -> None:
             val_days=args.cv_val_days,
             step_days=args.cv_step_days,
             min_train_days=args.cv_min_train_days,
+            use_residual_stacking=args.use_residual_stacking,
+            residual_oof_folds=args.residual_oof_folds,
+            residual_oof_val_days=args.residual_oof_val_days,
+            residual_oof_step_days=args.residual_oof_step_days,
+            residual_oof_min_train_days=args.residual_oof_min_train_days,
         )
 
     train_feat, test_feat = build_feature_table(train_df, test_df)
@@ -792,7 +949,16 @@ def main() -> None:
         if c in candidate_features
     ]
 
-    artifacts = train_global_and_local_models(train_feat, candidate_features, cat_cols)
+    artifacts = train_global_and_local_models(
+        train_feat,
+        candidate_features,
+        cat_cols,
+        use_residual_stacking=args.use_residual_stacking,
+        residual_oof_folds=args.residual_oof_folds,
+        residual_oof_val_days=args.residual_oof_val_days,
+        residual_oof_step_days=args.residual_oof_step_days,
+        residual_oof_min_train_days=args.residual_oof_min_train_days,
+    )
 
     # Add global prediction feature to test and run local market experts.
     test_feat = test_feat.copy()
@@ -805,7 +971,11 @@ def main() -> None:
             # Fallback to global if market-specific model doesn't exist.
             pred[idx] = test_feat.loc[idx, "global_pred_feature"].to_numpy(dtype=float)
             continue
-        pred[idx] = model.predict(test_feat.loc[idx, artifacts.feature_cols])
+        local_pred = model.predict(test_feat.loc[idx, artifacts.feature_cols])
+        if artifacts.local_target_is_residual:
+            pred[idx] = test_feat.loc[idx, "global_pred_feature"].to_numpy(dtype=float) + local_pred
+        else:
+            pred[idx] = local_pred
 
     if np.isnan(pred).any():
         raise ValueError("NaNs found in predictions.")
@@ -831,6 +1001,7 @@ def main() -> None:
     print(f"Features used: {len(artifacts.feature_cols)}")
     print(f"Categorical features: {artifacts.cat_cols}")
     print(f"Markets modeled: {sorted(artifacts.local_models.keys())}")
+    print(f"Local target is residual: {artifacts.local_target_is_residual}")
     print(f"CV RMSE: {cv_rmse}")
     if not cv_details.empty:
         cv_path = run_dir / "cv_results.csv"

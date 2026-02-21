@@ -1,0 +1,8 @@
+{
+  "run_dir": "runs/20260221-165533_per_market_interactions_202310_cv1_14d",
+  "global_sample_size_used": 1500,
+  "per_market_sample_size_requested": 400,
+  "rows_train": 99853,
+  "global_feature_count": 167,
+  "local_feature_count": 168
+}

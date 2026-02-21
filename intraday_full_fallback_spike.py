@@ -685,7 +685,8 @@ def main() -> None:
     if args.params_out:
         Path(args.params_out).write_text(json.dumps(model_params, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    latest_submission = Path("submission_intraday_pipeline.csv")
+    latest_submission = Path("csv/submission_intraday_pipeline.csv")
+    latest_submission.parent.mkdir(parents=True, exist_ok=True)
     submission.to_csv(latest_submission, index=False)
 
     print(f"Run ID: {run_id}")

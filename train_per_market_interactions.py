@@ -1476,7 +1476,8 @@ def main() -> None:
     sub_path = run_dir / "submission.csv"
     out_sub.to_csv(sub_path, index=False)
 
-    latest_path = Path("submission_per_market_interactions.csv")
+    latest_path = Path("csv/submission_per_market_interactions.csv")
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
     out_sub.to_csv(latest_path, index=False)
 
     print(f"Saved submission: {sub_path}")
@@ -1579,7 +1580,7 @@ def main() -> None:
                     "gate/tail blending logic is not decomposed in the SHAP output."
                 )
             shap_cmd = [
-                Path(__file__).with_name("shap_from_saved_models.py").as_posix(),
+                (Path(__file__).resolve().parent / "helpers" / "shap_from_saved_models.py").as_posix(),
                 "--run-dir",
                 str(run_dir),
                 "--global-sample-size",

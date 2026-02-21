@@ -204,7 +204,8 @@ def main() -> None:
 	train_path = data_dir / "train.csv"
 	test_path = data_dir / "test_for_participants.csv"
 	sample_submission_path = data_dir / "sample_submission.csv"
-	output_path = base_dir / "submission.csv"
+	output_path = base_dir / "csv" / "submission.csv"
+	output_path.parent.mkdir(parents=True, exist_ok=True)
 
 	for path in [train_path, test_path, sample_submission_path]:
 		if not path.exists():

@@ -17,6 +17,25 @@ from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import PowerTransformer
 
 
+DEFAULT_LOCAL_MODEL_A_PARAMS: dict[str, float | int] = {
+    "iterations": 3000,
+    "learning_rate": 0.025,
+    "depth": 8,
+    "l2_leaf_reg": 20.0,
+    "bagging_temperature": 0.4,
+    "random_strength": 0.9,
+}
+
+DEFAULT_LOCAL_MODEL_B_PARAMS: dict[str, float | int] = {
+    "iterations": 2200,
+    "learning_rate": 0.03,
+    "depth": 6,
+    "l2_leaf_reg": 28.0,
+    "bagging_temperature": 0.7,
+    "random_strength": 1.15,
+}
+
+
 def _write_params_yaml(path: Path, payload: dict[str, Any]) -> None:
     def _format_scalar(value: Any) -> str:
         if isinstance(value, (bool, np.bool_)):
@@ -65,6 +84,143 @@ def _write_params_yaml(path: Path, payload: dict[str, Any]) -> None:
         _emit(str(k), v, 0)
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _load_market_config(path: str | None) -> dict[str, Any]:
+    if not path:
+        return {"default": {}, "markets": {}}
+    cfg_path = Path(path)
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Market config file not found: {cfg_path}")
+    text = cfg_path.read_text(encoding="utf-8")
+
+    # Prefer JSON; optionally support YAML when PyYAML is available.
+    payload: dict[str, Any] | None = None
+    parse_errors: list[str] = []
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            payload = parsed
+    except Exception as exc:  # pragma: no cover - fallback path
+        parse_errors.append(f"json: {exc}")
+    if payload is None:
+        try:  # pragma: no cover - optional dependency
+            import yaml  # type: ignore
+
+            parsed = yaml.safe_load(text)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except Exception as exc:
+            parse_errors.append(f"yaml: {exc}")
+    if payload is None:
+        raise ValueError(
+            f"Failed parsing market config file {cfg_path}. "
+            f"Supported: JSON (or YAML when PyYAML is installed). Errors: {parse_errors}"
+        )
+
+    default = payload.get("default", {})
+    markets = payload.get("markets", {})
+    if not isinstance(default, dict):
+        raise ValueError("market config 'default' must be an object/dict")
+    if not isinstance(markets, dict):
+        raise ValueError("market config 'markets' must be an object/dict")
+    return {"default": default, "markets": markets}
+
+
+def _deep_merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge_dict(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _resolve_market_cfg(market_config: dict[str, Any], market: str) -> dict[str, Any]:
+    default_cfg = market_config.get("default", {}) if isinstance(market_config, dict) else {}
+    market_cfg_all = market_config.get("markets", {}) if isinstance(market_config, dict) else {}
+    market_cfg = market_cfg_all.get(str(market), {}) if isinstance(market_cfg_all, dict) else {}
+    if not isinstance(default_cfg, dict):
+        default_cfg = {}
+    if not isinstance(market_cfg, dict):
+        market_cfg = {}
+    return _deep_merge_dict(default_cfg, market_cfg)
+
+
+def _extract_market_cap_overrides(market_config: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(market_config, dict):
+        return out
+    markets = market_config.get("markets", {})
+    if not isinstance(markets, dict):
+        return out
+    for market, cfg in markets.items():
+        if not isinstance(cfg, dict):
+            continue
+        cap = cfg.get("cap")
+        if not isinstance(cap, dict):
+            continue
+        keep = {}
+        for k in ["lower_q", "upper_q", "min_rows"]:
+            if k in cap:
+                keep[k] = cap[k]
+        if keep:
+            out[str(market)] = keep
+    return out
+
+
+def _parse_timestamp_or_none(value: Any) -> pd.Timestamp | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        return None
+    ts = pd.Timestamp(text)
+    if pd.isna(ts):
+        return None
+    return ts
+
+
+def _normalize_blend_weights(a: float, b: float) -> tuple[float, float]:
+    a = float(a)
+    b = float(b)
+    if not np.isfinite(a) or not np.isfinite(b):
+        return 1.0, 0.0
+    if a < 0.0:
+        a = 0.0
+    if b < 0.0:
+        b = 0.0
+    s = a + b
+    if s <= 0.0:
+        return 1.0, 0.0
+    return a / s, b / s
+
+
+def _coerce_model_params(raw: dict[str, Any]) -> dict[str, Any]:
+    int_keys = {"iterations", "depth"}
+    float_keys = {"learning_rate", "l2_leaf_reg", "bagging_temperature", "random_strength"}
+    out: dict[str, Any] = {}
+    for k, v in raw.items():
+        if k in int_keys:
+            out[k] = int(v)
+        elif k in float_keys:
+            out[k] = float(v)
+    return out
+
+
+def _make_local_model(
+    *,
+    loss_function: str,
+    params: dict[str, Any],
+    random_seed: int,
+) -> CatBoostRegressor:
+    cfg = dict(params)
+    cfg["loss_function"] = loss_function
+    cfg["eval_metric"] = "RMSE"
+    cfg["random_seed"] = int(random_seed)
+    cfg["verbose"] = 0
+    return CatBoostRegressor(**cfg)
 
 
 def _to_datetime_col(df: pd.DataFrame, col: str) -> pd.Series:
@@ -842,6 +998,7 @@ def fit_market_hour_prediction_capper(
     upper_q: float,
     min_rows: int,
     softness: float,
+    market_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> PredictionCapper:
     if not (0.0 <= lower_q < upper_q <= 1.0):
         raise ValueError("Prediction cap quantiles must satisfy 0 <= lower < upper <= 1.")
@@ -852,25 +1009,48 @@ def fit_market_hour_prediction_capper(
 
     base = _ensure_hour_column(train_df)[["market", "hour", "target"]].copy()
 
-    g_mh = base.groupby(["market", "hour"], dropna=False)["target"]
-    by_mh = pd.concat(
-        [
-            g_mh.quantile(lower_q).rename("lower"),
-            g_mh.quantile(upper_q).rename("upper"),
-            g_mh.size().rename("n"),
-        ],
-        axis=1,
-    ).reset_index()
-    by_mh = by_mh.loc[by_mh["n"] >= int(min_rows)].copy()
+    market_overrides = market_overrides or {}
+    by_mh_rows: list[pd.DataFrame] = []
+    by_m_rows: list[dict[str, Any]] = []
+    for market, g in base.groupby("market", dropna=False):
+        mname = str(market)
+        over = market_overrides.get(mname, {})
+        try:
+            lq = float(over.get("lower_q", lower_q))
+            uq = float(over.get("upper_q", upper_q))
+            mr = int(over.get("min_rows", min_rows))
+            if not (0.0 <= lq < uq <= 1.0):
+                lq, uq = float(lower_q), float(upper_q)
+            if mr < 1:
+                mr = int(min_rows)
+        except Exception:
+            lq, uq, mr = float(lower_q), float(upper_q), int(min_rows)
 
-    g_m = base.groupby("market", dropna=False)["target"]
-    by_m = pd.concat(
-        [
-            g_m.quantile(lower_q).rename("lower"),
-            g_m.quantile(upper_q).rename("upper"),
-        ],
-        axis=1,
-    ).reset_index()
+        g_h = g.groupby("hour", dropna=False)["target"]
+        mh = pd.concat(
+            [
+                g_h.quantile(lq).rename("lower"),
+                g_h.quantile(uq).rename("upper"),
+                g_h.size().rename("n"),
+            ],
+            axis=1,
+        ).reset_index()
+        mh["market"] = mname
+        mh = mh.loc[mh["n"] >= mr].copy()
+        by_mh_rows.append(mh[["market", "hour", "lower", "upper", "n"]])
+
+        by_m_rows.append(
+            {
+                "market": mname,
+                "lower": float(g["target"].quantile(lq)),
+                "upper": float(g["target"].quantile(uq)),
+            }
+        )
+
+    by_mh = pd.concat(by_mh_rows, axis=0, ignore_index=True) if by_mh_rows else pd.DataFrame(
+        columns=["market", "hour", "lower", "upper", "n"]
+    )
+    by_m = pd.DataFrame(by_m_rows, columns=["market", "lower", "upper"])
 
     global_lower = float(base["target"].quantile(lower_q))
     global_upper = float(base["target"].quantile(upper_q))
@@ -919,6 +1099,9 @@ def apply_market_hour_prediction_caps(
 class TrainArtifacts:
     global_model: CatBoostRegressor
     local_models: dict[str, CatBoostRegressor]
+    local_models_b: dict[str, CatBoostRegressor]
+    local_blend_weights: dict[str, list[float]]
+    local_train_start_effective: dict[str, str | None]
     local_tail_models: dict[str, CatBoostRegressor]
     local_gate_models: dict[str, CatBoostClassifier]
     local_hour_models: dict[str, dict[str, CatBoostRegressor]]
@@ -942,6 +1125,7 @@ class TrainArtifacts:
     hour_expert_mode: str
     hour_expert_min_rows: int
     hour_expert_weight: float
+    use_dual_local_models: bool
 
 
 def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -1087,10 +1271,19 @@ def _predict_local_expert(
     market: str,
     X: pd.DataFrame,
 ) -> np.ndarray:
-    normal_model = artifacts.local_models.get(str(market))
-    if normal_model is None:
+    normal_model_a = artifacts.local_models.get(str(market))
+    if normal_model_a is None:
         raise KeyError(f"Missing normal local model for market={market}")
-    local_pred = _predict_point(normal_model, X[artifacts.feature_cols])
+    pred_a = _predict_point(normal_model_a, X[artifacts.feature_cols])
+    pred_b = None
+    normal_model_b = artifacts.local_models_b.get(str(market))
+    if normal_model_b is not None:
+        pred_b = _predict_point(normal_model_b, X[artifacts.feature_cols])
+    w_a, w_b = artifacts.local_blend_weights.get(str(market), [1.0, 0.0])
+    if pred_b is None or w_b <= 0.0:
+        local_pred = pred_a
+    else:
+        local_pred = float(w_a) * pred_a + float(w_b) * pred_b
 
     if artifacts.use_tail_experts:
         tail_model = artifacts.local_tail_models.get(str(market))
@@ -1192,6 +1385,12 @@ def run_time_series_cv(
     hour_expert_mode: str,
     hour_expert_min_rows: int,
     hour_expert_weight: float,
+    use_dual_local_models: bool,
+    local_blend_weight_a: float,
+    local_blend_weight_b: float,
+    local_train_start: str | None,
+    local_train_min_rows: int,
+    market_config: dict[str, Any] | None,
     use_market_hour_pred_caps: bool,
     pred_cap_lower_q: float,
     pred_cap_upper_q: float,
@@ -1213,6 +1412,7 @@ def run_time_series_cv(
     fold_rows: list[dict[str, object]] = []
     oof_rows: list[pd.DataFrame] = []
     oof = pd.Series(index=train_df_raw.index, dtype=float)
+    market_cap_overrides = _extract_market_cap_overrides(market_config)
 
     print(
         f"CV start: folds={len(folds)}, val_days={val_days}, step_days={step_days}, "
@@ -1281,6 +1481,12 @@ def run_time_series_cv(
             hour_expert_mode=hour_expert_mode,
             hour_expert_min_rows=hour_expert_min_rows,
             hour_expert_weight=hour_expert_weight,
+            use_dual_local_models=use_dual_local_models,
+            local_blend_weight_a=local_blend_weight_a,
+            local_blend_weight_b=local_blend_weight_b,
+            local_train_start=local_train_start,
+            local_train_min_rows=local_train_min_rows,
+            market_config=market_config,
         )
         va_feat = va_feat.copy()
         va_feat["global_pred_feature"] = _predict_point(artifacts.global_model, va_feat[feat_cols])
@@ -1312,6 +1518,7 @@ def run_time_series_cv(
                 upper_q=pred_cap_upper_q,
                 min_rows=pred_cap_min_rows,
                 softness=pred_cap_softness,
+                market_overrides=market_cap_overrides,
             )
             pred_original, n_capped = apply_market_hour_prediction_caps(
                 pred_original,
@@ -1394,6 +1601,12 @@ def train_global_and_local_models(
     hour_expert_mode: str = "block5",
     hour_expert_min_rows: int = 240,
     hour_expert_weight: float = 0.6,
+    use_dual_local_models: bool = True,
+    local_blend_weight_a: float = 0.5,
+    local_blend_weight_b: float = 0.5,
+    local_train_start: str | None = None,
+    local_train_min_rows: int = 500,
+    market_config: dict[str, Any] | None = None,
 ) -> TrainArtifacts:
     if not (0.0 < tail_quantile_upper < 1.0):
         raise ValueError("--tail-quantile-upper must be in (0,1)")
@@ -1405,6 +1618,8 @@ def train_global_and_local_models(
         raise ValueError("--tail-gate-threshold must be in [0,1)")
     if hour_expert_min_rows < 1:
         raise ValueError("--hour-expert-min-rows must be >= 1")
+    if local_train_min_rows < 1:
+        raise ValueError("--local-train-min-rows must be >= 1")
 
     transformed_target, t_state = _fit_target_transform(
         train_df["target"].to_numpy(dtype=float),
@@ -1432,22 +1647,55 @@ def train_global_and_local_models(
     if include_global_pred_in_local:
         local_feature_cols = local_feature_cols + ["global_pred_feature"]
     local_models: dict[str, CatBoostRegressor] = {}
+    local_models_b: dict[str, CatBoostRegressor] = {}
+    local_blend_weights: dict[str, list[float]] = {}
+    local_train_start_effective: dict[str, str | None] = {}
     local_tail_models: dict[str, CatBoostRegressor] = {}
     local_gate_models: dict[str, CatBoostClassifier] = {}
     local_hour_models: dict[str, dict[str, CatBoostRegressor]] = {}
     local_hour_model_counts: dict[str, dict[str, int]] = {}
-    for market, mdf in train_df.groupby("market", dropna=False):
-        normal_model = CatBoostRegressor(
+    market_cfg_payload = market_config or {"default": {}, "markets": {}}
+    global_local_cutoff = _parse_timestamp_or_none(local_train_start)
+    default_w_a, default_w_b = _normalize_blend_weights(local_blend_weight_a, local_blend_weight_b)
+    if not use_dual_local_models:
+        default_w_a, default_w_b = 1.0, 0.0
+
+    for market, mdf_raw in train_df.groupby("market", dropna=False):
+        mdf = mdf_raw.copy()
+        mcfg = _resolve_market_cfg(market_cfg_payload, str(market))
+
+        market_cutoff = _parse_timestamp_or_none(mcfg.get("train_start"))
+        if market_cutoff is None:
+            market_cutoff = global_local_cutoff
+        effective_cutoff: str | None = None
+        if market_cutoff is not None:
+            mdf_cut = mdf.loc[_to_datetime_col(mdf, "delivery_start") >= market_cutoff].copy()
+            if len(mdf_cut) >= local_train_min_rows:
+                mdf = mdf_cut
+                effective_cutoff = str(pd.Timestamp(market_cutoff).date())
+            else:
+                print(
+                    f"Local cutoff ignored for {market}: cutoff={pd.Timestamp(market_cutoff).date()} "
+                    f"rows_after={len(mdf_cut)} < min_rows={local_train_min_rows}"
+                )
+        local_train_start_effective[str(market)] = effective_cutoff
+
+        blend_raw = mcfg.get("blend_weights")
+        if isinstance(blend_raw, (list, tuple)) and len(blend_raw) >= 2:
+            w_a, w_b = _normalize_blend_weights(float(blend_raw[0]), float(blend_raw[1]))
+        else:
+            w_a, w_b = default_w_a, default_w_b
+        if not use_dual_local_models:
+            w_a, w_b = 1.0, 0.0
+        local_blend_weights[str(market)] = [float(w_a), float(w_b)]
+
+        params_a = dict(DEFAULT_LOCAL_MODEL_A_PARAMS)
+        if isinstance(mcfg.get("model_a"), dict):
+            params_a.update(_coerce_model_params(mcfg["model_a"]))
+        normal_model = _make_local_model(
             loss_function=loss_function,
-            eval_metric="RMSE",
-            iterations=3000,
-            learning_rate=0.025,
-            depth=8,
-            l2_leaf_reg=20.0,
-            bagging_temperature=0.4,
-            random_strength=0.9,
+            params=params_a,
             random_seed=42,
-            verbose=0,
         )
         local_target = (
             mdf["target_transformed"] - mdf["global_pred_feature"]
@@ -1458,7 +1706,23 @@ def train_global_and_local_models(
         local_cat_cols = [c for c in cat_cols if c in local_feature_cols]
         normal_model.fit(mdf[local_feature_cols], local_target_np, cat_features=local_cat_cols)
         local_models[str(market)] = normal_model
-        print(f"Trained local model for {market} ({len(mdf)} rows)")
+        normal_model_b: CatBoostRegressor | None = None
+        if use_dual_local_models and w_b > 0.0:
+            params_b = dict(DEFAULT_LOCAL_MODEL_B_PARAMS)
+            if isinstance(mcfg.get("model_b"), dict):
+                params_b.update(_coerce_model_params(mcfg["model_b"]))
+            normal_model_b = _make_local_model(
+                loss_function=loss_function,
+                params=params_b,
+                random_seed=137,
+            )
+            normal_model_b.fit(mdf[local_feature_cols], local_target_np, cat_features=local_cat_cols)
+            local_models_b[str(market)] = normal_model_b
+        print(
+            f"Trained local model(s) for {market} ({len(mdf)} rows) "
+            f"blend=({w_a:.2f},{w_b:.2f}) "
+            f"cutoff={effective_cutoff if effective_cutoff is not None else 'none'}"
+        )
 
         tail_model_for_market: CatBoostRegressor | None = None
         gate_model_for_market: CatBoostClassifier | None = None
@@ -1536,6 +1800,9 @@ def train_global_and_local_models(
         if use_hour_experts:
             # Recompute local base prediction (normal + optional tail blend).
             base_local_pred = _predict_point(normal_model, mdf[local_feature_cols])
+            if normal_model_b is not None and w_b > 0.0:
+                base_local_pred_b = _predict_point(normal_model_b, mdf[local_feature_cols])
+                base_local_pred = float(w_a) * base_local_pred + float(w_b) * base_local_pred_b
             if tail_model_for_market is not None and gate_model_for_market is not None:
                 tail_pred_for_market = _predict_point(tail_model_for_market, mdf[local_feature_cols])
                 tail_prob_for_market = _predict_tail_probability(gate_model_for_market, mdf[local_feature_cols])
@@ -1593,6 +1860,9 @@ def train_global_and_local_models(
     return TrainArtifacts(
         global_model=global_model,
         local_models=local_models,
+        local_models_b=local_models_b,
+        local_blend_weights=local_blend_weights,
+        local_train_start_effective=local_train_start_effective,
         local_tail_models=local_tail_models,
         local_gate_models=local_gate_models,
         local_hour_models=local_hour_models,
@@ -1616,6 +1886,7 @@ def train_global_and_local_models(
         hour_expert_mode=hour_expert_mode,
         hour_expert_min_rows=hour_expert_min_rows,
         hour_expert_weight=hour_expert_weight,
+        use_dual_local_models=use_dual_local_models,
     )
 
 
@@ -1679,6 +1950,11 @@ def main() -> None:
     parser.add_argument("--sample-submission", default="data/sample_submission.csv")
     parser.add_argument("--out-dir", default="runs")
     parser.add_argument("--name", default="per_market_interactions_hour_experts")
+    parser.add_argument(
+        "--market-config",
+        default=None,
+        help="Optional JSON/YAML path with per-market settings (train_start, blend_weights, model_a/model_b params).",
+    )
     parser.add_argument("--exclude-2023", action="store_true")
     parser.add_argument("--exclude-2023-keep-from-month", type=int, default=10)
     parser.add_argument("--cv", action="store_true")
@@ -1873,6 +2149,35 @@ def main() -> None:
         help="Global scaling applied to hour-expert correction (default: 0.6).",
     )
     parser.add_argument(
+        "--use-dual-local-models",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Train two local models per market and blend them (default: enabled).",
+    )
+    parser.add_argument(
+        "--local-blend-weight-a",
+        type=float,
+        default=0.5,
+        help="Default blend weight for local model A (default: 0.5).",
+    )
+    parser.add_argument(
+        "--local-blend-weight-b",
+        type=float,
+        default=0.5,
+        help="Default blend weight for local model B (default: 0.5).",
+    )
+    parser.add_argument(
+        "--local-train-start",
+        default=None,
+        help="Optional YYYY-MM-DD cutoff for local market models; older rows are dropped if enough rows remain.",
+    )
+    parser.add_argument(
+        "--local-train-min-rows",
+        type=int,
+        default=500,
+        help="Minimum rows required after local-train-start filter, otherwise cutoff is ignored (default: 500).",
+    )
+    parser.add_argument(
         "--use-market-hour-pred-caps",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1928,6 +2233,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     tail_delta_clip = args.tail_delta_clip if args.tail_delta_clip > 0 else None
+    market_config = _load_market_config(args.market_config)
 
     train_df = pd.read_csv(args.train_path)
     test_df = pd.read_csv(args.test_path)
@@ -1977,6 +2283,12 @@ def main() -> None:
             hour_expert_mode=args.hour_expert_mode,
             hour_expert_min_rows=args.hour_expert_min_rows,
             hour_expert_weight=args.hour_expert_weight,
+            use_dual_local_models=args.use_dual_local_models,
+            local_blend_weight_a=args.local_blend_weight_a,
+            local_blend_weight_b=args.local_blend_weight_b,
+            local_train_start=args.local_train_start,
+            local_train_min_rows=args.local_train_min_rows,
+            market_config=market_config,
             use_market_hour_pred_caps=args.use_market_hour_pred_caps,
             pred_cap_lower_q=args.pred_cap_lower_q,
             pred_cap_upper_q=args.pred_cap_upper_q,
@@ -2033,6 +2345,12 @@ def main() -> None:
         hour_expert_mode=args.hour_expert_mode,
         hour_expert_min_rows=args.hour_expert_min_rows,
         hour_expert_weight=args.hour_expert_weight,
+        use_dual_local_models=args.use_dual_local_models,
+        local_blend_weight_a=args.local_blend_weight_a,
+        local_blend_weight_b=args.local_blend_weight_b,
+        local_train_start=args.local_train_start,
+        local_train_min_rows=args.local_train_min_rows,
+        market_config=market_config,
     )
 
     # Add global prediction feature to test and run local market experts.
@@ -2061,12 +2379,14 @@ def main() -> None:
 
     pred = _apply_target_inverse(pred, artifacts.target_transform_state)
     if args.use_market_hour_pred_caps:
+        market_cap_overrides = _extract_market_cap_overrides(market_config)
         capper = fit_market_hour_prediction_capper(
             train_feat,
             lower_q=args.pred_cap_lower_q,
             upper_q=args.pred_cap_upper_q,
             min_rows=args.pred_cap_min_rows,
             softness=args.pred_cap_softness,
+            market_overrides=market_cap_overrides,
         )
         pred, n_capped = apply_market_hour_prediction_caps(
             pred,
@@ -2115,6 +2435,11 @@ def main() -> None:
     print(f"Features used: {len(artifacts.feature_cols)}")
     print(f"Categorical features: {artifacts.cat_cols}")
     print(f"Markets modeled: {sorted(artifacts.local_models.keys())}")
+    print(f"Dual local models enabled: {artifacts.use_dual_local_models}")
+    if artifacts.use_dual_local_models:
+        print(f"Local model B trained markets: {len(artifacts.local_models_b)}")
+    if args.market_config:
+        print(f"Market config: {args.market_config}")
     print(f"Local target is residual: {artifacts.local_target_is_residual}")
     print(f"Local uses global_pred_feature: {artifacts.local_uses_global_pred_feature}")
     print(f"Tail experts enabled: {artifacts.use_tail_experts}")
@@ -2177,6 +2502,13 @@ def main() -> None:
             model.save_model(local_path)
             local_model_paths[str(market)] = str(local_path.name)
 
+        local_model_b_paths: dict[str, str] = {}
+        for market, model in artifacts.local_models_b.items():
+            safe_market = str(market).replace(" ", "_")
+            local_path = models_dir / f"local_model_b_{safe_market}.cbm"
+            model.save_model(local_path)
+            local_model_b_paths[str(market)] = str(local_path.name)
+
         local_tail_model_paths: dict[str, str] = {}
         for market, model in artifacts.local_tail_models.items():
             safe_market = str(market).replace(" ", "_")
@@ -2209,12 +2541,16 @@ def main() -> None:
         model_meta = {
             "global_model": str(global_model_path.name),
             "local_models": local_model_paths,
+            "local_models_b": local_model_b_paths,
+            "local_blend_weights": artifacts.local_blend_weights,
+            "local_train_start_effective": artifacts.local_train_start_effective,
             "local_tail_models": local_tail_model_paths,
             "local_gate_models": local_gate_model_paths,
             "local_hour_models": local_hour_model_paths,
             "local_hour_model_counts": artifacts.local_hour_model_counts,
             "feature_cols": artifacts.feature_cols,
             "cat_cols": artifacts.cat_cols,
+            "use_dual_local_models": artifacts.use_dual_local_models,
             "local_target_is_residual": artifacts.local_target_is_residual,
             "local_uses_global_pred_feature": artifacts.local_uses_global_pred_feature,
             "tail_expert_config": {
@@ -2237,6 +2573,7 @@ def main() -> None:
             },
             "target_transform": artifacts.target_transform_state.to_metadata(),
             "candidate_features_before_global_pred": candidate_features,
+            "market_config": market_config,
             "train_args": vars(args),
         }
         model_meta_path = run_dir / "model_metadata.json"

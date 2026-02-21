@@ -1,0 +1,9 @@
+{
+  "run_dir": "runs/20260220-223318_dual_market_cfg_cv3",
+  "feature_builder": "train_per_market_interactions_hour_experts",
+  "global_sample_size_used": 1500,
+  "per_market_sample_size_requested": 400,
+  "rows_train_after_filter": 132608,
+  "global_feature_count": 218,
+  "local_feature_count": 218
+}

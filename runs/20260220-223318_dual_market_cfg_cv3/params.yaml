@@ -1,0 +1,65 @@
+run_id: "20260220-223318_dual_market_cfg_cv3"
+name: "dual_market_cfg_cv3"
+generated_at: "2026-02-20T22:33:18.051994"
+cv_rmse: 92.55128090546499
+target_transform:
+  method: "none"
+args:
+  train_path: "data/train.csv"
+  test_path: "data/test_for_participants.csv"
+  sample_submission: "data/sample_submission.csv"
+  out_dir: "runs"
+  name: "dual_market_cfg_cv3"
+  market_config: "/Users/simonbisgaard/Desktop/nitor/configs/market_ensemble_template.json"
+  exclude_2023: false
+  exclude_2023_keep_from_month: 10
+  cv: true
+  cv_folds: 3
+  cv_val_days: 60
+  cv_step_days: 7
+  cv_min_train_days: 120
+  use_dynamic_target_profiles: true
+  use_robust_target_profiles: true
+  profile_winsor_lower_q: 0.01
+  profile_winsor_upper_q: 0.99
+  profile_winsor_min_rows: 24
+  profile_shrink_alpha_mhd: 24.0
+  profile_shrink_alpha_m: 24.0
+  use_temporal_regime: false
+  use_volatility_regime: false
+  use_wind_proxy: false
+  use_anomaly_features: true
+  use_cross_market_rank_features: true
+  use_peak_interactions: true
+  local_residual_modeling: true
+  include_global_pred_in_local: false
+  loss_function: "RMSE"
+  target_transform: "none"
+  use_tail_experts: false
+  tail_label_mode: "upper"
+  tail_quantile_upper: 0.99
+  tail_quantile_lower: 0.01
+  tail_model_mode: "tail_only"
+  tail_weight: 6.0
+  tail_min_rows: 120
+  tail_gate_threshold: 0.95
+  tail_blend_mode: "soft"
+  tail_delta_clip: 250.0
+  use_hour_experts: false
+  hour_expert_mode: "block5"
+  hour_expert_min_rows: 240
+  hour_expert_weight: 0.6
+  use_dual_local_models: true
+  local_blend_weight_a: 0.5
+  local_blend_weight_b: 0.5
+  local_train_start: null
+  local_train_min_rows: 500
+  use_market_hour_pred_caps: true
+  pred_cap_lower_q: 0.01
+  pred_cap_upper_q: 0.99
+  pred_cap_min_rows: 24
+  pred_cap_softness: 0.1
+  save_models: true
+  save_shap: true
+  shap_global_sample_size: 1500
+  shap_per_market_sample_size: 400

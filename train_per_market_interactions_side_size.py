@@ -608,6 +608,9 @@ class TrainArtifacts:
     local_side_models: dict[str, CatBoostClassifier]
     local_pos_size_models: dict[str, CatBoostRegressor]
     local_neg_size_models: dict[str, CatBoostRegressor]
+    local_peak_gate_models: dict[str, CatBoostClassifier]
+    local_peak_uplift_models: dict[str, CatBoostRegressor]
+    local_peak_uplift_caps: dict[str, float]
     feature_cols: list[str]
     cat_cols: list[str]
     local_target_is_residual: bool
@@ -615,6 +618,14 @@ class TrainArtifacts:
     target_transform_state: TargetTransformState
     use_side_size_modeling: bool
     side_size_min_rows: int
+    use_peak_head: bool
+    peak_label_quantile: float
+    peak_hour_min_rows: int
+    peak_min_rows: int
+    peak_gate_threshold: float
+    peak_blend_mode: str
+    peak_uplift_positive_only: bool
+    peak_uplift_cap_quantile: float
 
 
 def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -691,6 +702,33 @@ def _predict_binary_probability(model: CatBoostClassifier, X: pd.DataFrame) -> n
     return proba.astype(float)
 
 
+def _compute_peak_mask_per_market_hour(
+    y_true: pd.Series,
+    hour_col: pd.Series,
+    *,
+    quantile: float,
+    hour_min_rows: int,
+) -> np.ndarray:
+    tmp = pd.DataFrame({"y": y_true.to_numpy(dtype=float), "hour": hour_col.to_numpy()})
+    market_q = float(tmp["y"].quantile(quantile))
+    mask = np.zeros(len(tmp), dtype=bool)
+    for _, idx in tmp.groupby("hour", dropna=False, sort=False).groups.items():
+        pos = np.asarray(idx, dtype=int)
+        vals = tmp.iloc[pos]["y"]
+        q = float(vals.quantile(quantile)) if len(vals) >= hour_min_rows else market_q
+        mask[pos] = vals.to_numpy(dtype=float) >= q
+    return mask
+
+
+def _compute_gate_weight(prob: np.ndarray, threshold: float, mode: str) -> np.ndarray:
+    if mode == "hard":
+        return (prob >= threshold).astype(float)
+    if mode == "soft":
+        denom = max(1.0 - threshold, 1e-6)
+        return np.clip((prob - threshold) / denom, 0.0, 1.0)
+    raise ValueError(f"Unsupported peak blend mode: {mode}")
+
+
 def _predict_local_side_size(
     artifacts: TrainArtifacts,
     market: str,
@@ -701,18 +739,36 @@ def _predict_local_side_size(
         raise KeyError(f"Missing normal local model for market={market}")
     normal_pred = _predict_point(normal_model, X[artifacts.feature_cols])
 
-    if not artifacts.use_side_size_modeling:
-        return normal_pred
-    side_model = artifacts.local_side_models.get(str(market))
-    pos_size_model = artifacts.local_pos_size_models.get(str(market))
-    neg_size_model = artifacts.local_neg_size_models.get(str(market))
-    if side_model is None or pos_size_model is None or neg_size_model is None:
-        return normal_pred
+    local_pred = normal_pred
+    if artifacts.use_side_size_modeling:
+        side_model = artifacts.local_side_models.get(str(market))
+        pos_size_model = artifacts.local_pos_size_models.get(str(market))
+        neg_size_model = artifacts.local_neg_size_models.get(str(market))
+        if side_model is not None and pos_size_model is not None and neg_size_model is not None:
+            p_neg = _predict_binary_probability(side_model, X[artifacts.feature_cols])
+            pos_size = np.clip(_predict_point(pos_size_model, X[artifacts.feature_cols]), 0.0, None)
+            neg_size = np.clip(_predict_point(neg_size_model, X[artifacts.feature_cols]), 0.0, None)
+            local_pred = (1.0 - p_neg) * pos_size - p_neg * neg_size
 
-    p_neg = _predict_binary_probability(side_model, X[artifacts.feature_cols])
-    pos_size = np.clip(_predict_point(pos_size_model, X[artifacts.feature_cols]), 0.0, None)
-    neg_size = np.clip(_predict_point(neg_size_model, X[artifacts.feature_cols]), 0.0, None)
-    return (1.0 - p_neg) * pos_size - p_neg * neg_size
+    if not artifacts.use_peak_head:
+        return local_pred
+    peak_gate = artifacts.local_peak_gate_models.get(str(market))
+    peak_uplift = artifacts.local_peak_uplift_models.get(str(market))
+    if peak_gate is None or peak_uplift is None:
+        return local_pred
+
+    p_peak = _predict_binary_probability(peak_gate, X[artifacts.feature_cols])
+    peak_weight = _compute_gate_weight(p_peak, artifacts.peak_gate_threshold, artifacts.peak_blend_mode)
+    uplift = _predict_point(peak_uplift, X[artifacts.feature_cols])
+    if artifacts.peak_uplift_positive_only:
+        uplift = np.clip(uplift, 0.0, None)
+    cap = artifacts.local_peak_uplift_caps.get(str(market))
+    if cap is not None and np.isfinite(cap) and cap > 0:
+        if artifacts.peak_uplift_positive_only:
+            uplift = np.clip(uplift, 0.0, cap)
+        else:
+            uplift = np.clip(uplift, -cap, cap)
+    return local_pred + peak_weight * uplift
 
 
 def make_time_series_folds(
@@ -760,6 +816,14 @@ def run_time_series_cv(
     target_transform: str,
     use_side_size_modeling: bool,
     side_size_min_rows: int,
+    use_peak_head: bool,
+    peak_label_quantile: float,
+    peak_hour_min_rows: int,
+    peak_min_rows: int,
+    peak_gate_threshold: float,
+    peak_blend_mode: str,
+    peak_uplift_positive_only: bool,
+    peak_uplift_cap_quantile: float,
 ) -> tuple[float | None, pd.DataFrame, pd.DataFrame]:
     folds = make_time_series_folds(
         train_df=train_df_raw,
@@ -826,6 +890,14 @@ def run_time_series_cv(
             target_transform=target_transform,
             use_side_size_modeling=use_side_size_modeling,
             side_size_min_rows=side_size_min_rows,
+            use_peak_head=use_peak_head,
+            peak_label_quantile=peak_label_quantile,
+            peak_hour_min_rows=peak_hour_min_rows,
+            peak_min_rows=peak_min_rows,
+            peak_gate_threshold=peak_gate_threshold,
+            peak_blend_mode=peak_blend_mode,
+            peak_uplift_positive_only=peak_uplift_positive_only,
+            peak_uplift_cap_quantile=peak_uplift_cap_quantile,
         )
         va_feat = va_feat.copy()
         va_feat["global_pred_feature"] = _predict_point(artifacts.global_model, va_feat[feat_cols])
@@ -853,16 +925,14 @@ def run_time_series_cv(
 
         fold_rmse = _rmse(va["target"].to_numpy(dtype=float), pred_original)
         print(f"CV fold {fold_idx} RMSE={fold_rmse:.6f}")
-        fold_rows.append(
-            {
-                "fold": fold_idx,
-                "val_start": str(val_start.date()),
-                "val_end": str(val_end.date()),
-                "rmse": fold_rmse,
-                "train_rows": len(tr),
-                "val_rows": len(va),
-            }
-        )
+        fold_row: dict[str, object] = {
+            "fold": fold_idx,
+            "val_start": str(val_start.date()),
+            "val_end": str(val_end.date()),
+            "rmse": fold_rmse,
+            "train_rows": len(tr),
+            "val_rows": len(va),
+        }
 
         tmp = pd.DataFrame(
             {
@@ -875,9 +945,33 @@ def run_time_series_cv(
                 "fold": fold_idx,
             }
         )
+        peak_precisions: list[float] = []
+        peak_recalls: list[float] = []
         for market, sdf in tmp.groupby("market"):
             m_rmse = _rmse(sdf["y_true"].to_numpy(), sdf["y_pred"].to_numpy())
             print(f"  - {market}: RMSE={m_rmse:.6f} (n={len(sdf)})")
+            y_true_m = sdf["y_true"].to_numpy(dtype=float)
+            y_pred_m = sdf["y_pred"].to_numpy(dtype=float)
+            q_m = float(np.quantile(y_true_m, peak_label_quantile))
+            actual_peak = y_true_m >= q_m
+            pred_peak = y_pred_m >= q_m
+            tp = int(np.sum(actual_peak & pred_peak))
+            fp = int(np.sum((~actual_peak) & pred_peak))
+            fn = int(np.sum(actual_peak & (~pred_peak)))
+            prec = float(tp / (tp + fp)) if (tp + fp) > 0 else float("nan")
+            rec = float(tp / (tp + fn)) if (tp + fn) > 0 else float("nan")
+            peak_precisions.append(prec)
+            peak_recalls.append(rec)
+            print(
+                f"    peaks@q{peak_label_quantile:.3f}: "
+                f"precision={prec:.4f} recall={rec:.4f} tp={tp} fp={fp} fn={fn}"
+            )
+        if peak_precisions:
+            valid_prec = [x for x in peak_precisions if np.isfinite(x)]
+            valid_rec = [x for x in peak_recalls if np.isfinite(x)]
+            fold_row["peak_precision_mean"] = float(np.mean(valid_prec)) if valid_prec else None
+            fold_row["peak_recall_mean"] = float(np.mean(valid_rec)) if valid_rec else None
+        fold_rows.append(fold_row)
         oof_rows.append(
             tmp.rename(columns={"y_true": "target", "y_pred": "pred"})[
                 ["id", "delivery_start", "market", "target", "pred", "fold"]
@@ -910,9 +1004,29 @@ def train_global_and_local_models(
     target_transform: str = "none",
     use_side_size_modeling: bool = True,
     side_size_min_rows: int = 120,
+    use_peak_head: bool = True,
+    peak_label_quantile: float = 0.99,
+    peak_hour_min_rows: int = 96,
+    peak_min_rows: int = 80,
+    peak_gate_threshold: float = 0.6,
+    peak_blend_mode: str = "soft",
+    peak_uplift_positive_only: bool = True,
+    peak_uplift_cap_quantile: float = 0.995,
 ) -> TrainArtifacts:
     if side_size_min_rows < 1:
         raise ValueError("--side-size-min-rows must be >= 1")
+    if not (0.0 < peak_label_quantile < 1.0):
+        raise ValueError("--peak-label-quantile must be in (0,1)")
+    if peak_hour_min_rows < 1:
+        raise ValueError("--peak-hour-min-rows must be >= 1")
+    if peak_min_rows < 1:
+        raise ValueError("--peak-min-rows must be >= 1")
+    if not (0.0 <= peak_gate_threshold < 1.0):
+        raise ValueError("--peak-gate-threshold must be in [0,1)")
+    if peak_blend_mode not in {"soft", "hard"}:
+        raise ValueError("--peak-blend-mode must be one of: soft, hard")
+    if not (0.0 < peak_uplift_cap_quantile <= 1.0):
+        raise ValueError("--peak-uplift-cap-quantile must be in (0,1]")
 
     transformed_target, t_state = _fit_target_transform(
         train_df["target"].to_numpy(dtype=float),
@@ -943,6 +1057,9 @@ def train_global_and_local_models(
     local_side_models: dict[str, CatBoostClassifier] = {}
     local_pos_size_models: dict[str, CatBoostRegressor] = {}
     local_neg_size_models: dict[str, CatBoostRegressor] = {}
+    local_peak_gate_models: dict[str, CatBoostClassifier] = {}
+    local_peak_uplift_models: dict[str, CatBoostRegressor] = {}
+    local_peak_uplift_caps: dict[str, float] = {}
     for market, mdf in train_df.groupby("market", dropna=False):
         normal_model = CatBoostRegressor(
             loss_function=loss_function,
@@ -967,22 +1084,106 @@ def train_global_and_local_models(
         local_models[str(market)] = normal_model
         print(f"Trained local model for {market} ({len(mdf)} rows)")
 
-        if not use_side_size_modeling:
+        side_model: CatBoostClassifier | None = None
+        pos_size_model: CatBoostRegressor | None = None
+        neg_size_model: CatBoostRegressor | None = None
+
+        if use_side_size_modeling:
+            neg_mask = local_target_np < 0.0
+            pos_mask = ~neg_mask
+            n_neg = int(neg_mask.sum())
+            n_pos = int(pos_mask.sum())
+            if n_neg < side_size_min_rows or n_pos < side_size_min_rows:
+                print(
+                    f"Skipped side/size for {market}: "
+                    f"neg_rows={n_neg}, pos_rows={n_pos}, required_min={side_size_min_rows}"
+                )
+            else:
+                side_labels = neg_mask.astype(int)
+                side_model = CatBoostClassifier(
+                    loss_function="Logloss",
+                    eval_metric="AUC",
+                    iterations=900,
+                    learning_rate=0.04,
+                    depth=6,
+                    l2_leaf_reg=12.0,
+                    auto_class_weights="Balanced",
+                    random_seed=42,
+                    verbose=0,
+                )
+                side_model.fit(mdf[local_feature_cols], side_labels, cat_features=local_cat_cols)
+                local_side_models[str(market)] = side_model
+
+                pos_size_model = CatBoostRegressor(
+                    loss_function=loss_function,
+                    eval_metric="RMSE",
+                    iterations=2200,
+                    learning_rate=0.03,
+                    depth=7,
+                    l2_leaf_reg=24.0,
+                    bagging_temperature=0.6,
+                    random_strength=1.1,
+                    random_seed=42,
+                    verbose=0,
+                )
+                pos_size_model.fit(
+                    mdf.loc[pos_mask, local_feature_cols],
+                    local_target_np[pos_mask],
+                    cat_features=local_cat_cols,
+                )
+                local_pos_size_models[str(market)] = pos_size_model
+
+                neg_size_model = CatBoostRegressor(
+                    loss_function=loss_function,
+                    eval_metric="RMSE",
+                    iterations=2200,
+                    learning_rate=0.03,
+                    depth=7,
+                    l2_leaf_reg=24.0,
+                    bagging_temperature=0.6,
+                    random_strength=1.1,
+                    random_seed=42,
+                    verbose=0,
+                )
+                neg_size_model.fit(
+                    mdf.loc[neg_mask, local_feature_cols],
+                    -local_target_np[neg_mask],
+                    cat_features=local_cat_cols,
+                )
+                local_neg_size_models[str(market)] = neg_size_model
+
+                print(
+                    f"Trained side/size for {market} "
+                    f"(neg_rows={n_neg}, pos_rows={n_pos})"
+                )
+
+        if not use_peak_head:
             continue
 
-        neg_mask = local_target_np < 0.0
-        pos_mask = ~neg_mask
-        n_neg = int(neg_mask.sum())
-        n_pos = int(pos_mask.sum())
-        if n_neg < side_size_min_rows or n_pos < side_size_min_rows:
+        if "hour" in mdf.columns:
+            local_hour = mdf["hour"]
+        else:
+            local_hour = _to_datetime_col(mdf, "delivery_start").dt.hour
+        peak_mask = _compute_peak_mask_per_market_hour(
+            mdf["target"],
+            local_hour,
+            quantile=peak_label_quantile,
+            hour_min_rows=peak_hour_min_rows,
+        )
+        n_peak = int(peak_mask.sum())
+        if n_peak < peak_min_rows or n_peak >= len(mdf):
             print(
-                f"Skipped side/size for {market}: "
-                f"neg_rows={n_neg}, pos_rows={n_pos}, required_min={side_size_min_rows}"
+                f"Skipped peak head for {market}: "
+                f"peak_rows={n_peak}, required_min={peak_min_rows}"
             )
             continue
 
-        side_labels = neg_mask.astype(int)
-        side_model = CatBoostClassifier(
+        peak_labels = peak_mask.astype(int)
+        if peak_labels.min() == peak_labels.max():
+            print(f"Skipped peak gate for {market}: single-class labels")
+            continue
+
+        peak_gate_model = CatBoostClassifier(
             loss_function="Logloss",
             eval_metric="AUC",
             iterations=900,
@@ -993,50 +1194,49 @@ def train_global_and_local_models(
             random_seed=42,
             verbose=0,
         )
-        side_model.fit(mdf[local_feature_cols], side_labels, cat_features=local_cat_cols)
-        local_side_models[str(market)] = side_model
+        peak_gate_model.fit(mdf[local_feature_cols], peak_labels, cat_features=local_cat_cols)
+        local_peak_gate_models[str(market)] = peak_gate_model
 
-        pos_size_model = CatBoostRegressor(
+        if side_model is not None and pos_size_model is not None and neg_size_model is not None:
+            p_neg_train = _predict_binary_probability(side_model, mdf[local_feature_cols])
+            pos_size_train = np.clip(_predict_point(pos_size_model, mdf[local_feature_cols]), 0.0, None)
+            neg_size_train = np.clip(_predict_point(neg_size_model, mdf[local_feature_cols]), 0.0, None)
+            base_local_pred = (1.0 - p_neg_train) * pos_size_train - p_neg_train * neg_size_train
+        else:
+            base_local_pred = _predict_point(normal_model, mdf[local_feature_cols])
+
+        uplift_target = local_target_np - base_local_pred
+        peak_uplift_model = CatBoostRegressor(
             loss_function=loss_function,
             eval_metric="RMSE",
-            iterations=2200,
+            iterations=1800,
             learning_rate=0.03,
             depth=7,
-            l2_leaf_reg=24.0,
-            bagging_temperature=0.6,
-            random_strength=1.1,
+            l2_leaf_reg=22.0,
+            bagging_temperature=0.5,
+            random_strength=1.0,
             random_seed=42,
             verbose=0,
         )
-        pos_size_model.fit(
-            mdf.loc[pos_mask, local_feature_cols],
-            local_target_np[pos_mask],
+        peak_uplift_model.fit(
+            mdf.loc[peak_mask, local_feature_cols],
+            uplift_target[peak_mask],
             cat_features=local_cat_cols,
         )
-        local_pos_size_models[str(market)] = pos_size_model
+        local_peak_uplift_models[str(market)] = peak_uplift_model
 
-        neg_size_model = CatBoostRegressor(
-            loss_function=loss_function,
-            eval_metric="RMSE",
-            iterations=2200,
-            learning_rate=0.03,
-            depth=7,
-            l2_leaf_reg=24.0,
-            bagging_temperature=0.6,
-            random_strength=1.1,
-            random_seed=42,
-            verbose=0,
-        )
-        neg_size_model.fit(
-            mdf.loc[neg_mask, local_feature_cols],
-            -local_target_np[neg_mask],
-            cat_features=local_cat_cols,
-        )
-        local_neg_size_models[str(market)] = neg_size_model
+        if peak_uplift_positive_only:
+            cap_source = uplift_target[peak_mask]
+            cap_source = cap_source[cap_source > 0]
+            cap_val = float(np.quantile(cap_source, peak_uplift_cap_quantile)) if len(cap_source) > 0 else 0.0
+        else:
+            cap_val = float(np.quantile(np.abs(uplift_target[peak_mask]), peak_uplift_cap_quantile))
+        if np.isfinite(cap_val) and cap_val > 0:
+            local_peak_uplift_caps[str(market)] = cap_val
 
         print(
-            f"Trained side/size for {market} "
-            f"(neg_rows={n_neg}, pos_rows={n_pos})"
+            f"Trained peak head for {market} "
+            f"(peak_rows={n_peak}, gate_tau={peak_gate_threshold}, uplift_cap={cap_val:.3f})"
         )
 
     return TrainArtifacts(
@@ -1045,6 +1245,9 @@ def train_global_and_local_models(
         local_side_models=local_side_models,
         local_pos_size_models=local_pos_size_models,
         local_neg_size_models=local_neg_size_models,
+        local_peak_gate_models=local_peak_gate_models,
+        local_peak_uplift_models=local_peak_uplift_models,
+        local_peak_uplift_caps=local_peak_uplift_caps,
         feature_cols=local_feature_cols,
         cat_cols=cat_cols,
         local_target_is_residual=local_residual_modeling,
@@ -1052,6 +1255,14 @@ def train_global_and_local_models(
         target_transform_state=t_state,
         use_side_size_modeling=use_side_size_modeling,
         side_size_min_rows=side_size_min_rows,
+        use_peak_head=use_peak_head,
+        peak_label_quantile=peak_label_quantile,
+        peak_hour_min_rows=peak_hour_min_rows,
+        peak_min_rows=peak_min_rows,
+        peak_gate_threshold=peak_gate_threshold,
+        peak_blend_mode=peak_blend_mode,
+        peak_uplift_positive_only=peak_uplift_positive_only,
+        peak_uplift_cap_quantile=peak_uplift_cap_quantile,
     )
 
 
@@ -1189,6 +1400,54 @@ def main() -> None:
         help="Minimum positive and negative rows per market required to fit side/size local models (default: 120).",
     )
     parser.add_argument(
+        "--use-peak-head",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable per-market peak gate + uplift head on top of local predictions (default: enabled).",
+    )
+    parser.add_argument(
+        "--peak-label-quantile",
+        type=float,
+        default=0.99,
+        help="Peak label quantile per market-hour used for gate labels (default: 0.99).",
+    )
+    parser.add_argument(
+        "--peak-hour-min-rows",
+        type=int,
+        default=96,
+        help="Min rows per hour in a market to use hour-specific quantile; otherwise fallback to market quantile.",
+    )
+    parser.add_argument(
+        "--peak-min-rows",
+        type=int,
+        default=80,
+        help="Minimum labeled peak rows per market to train peak gate/uplift models.",
+    )
+    parser.add_argument(
+        "--peak-gate-threshold",
+        type=float,
+        default=0.6,
+        help="Peak gate threshold for activating uplift (default: 0.6).",
+    )
+    parser.add_argument(
+        "--peak-blend-mode",
+        choices=["soft", "hard"],
+        default="soft",
+        help="Peak uplift blending: soft probability weighting or hard switch.",
+    )
+    parser.add_argument(
+        "--peak-uplift-positive-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Constrain peak uplift to non-negative adjustments only (default: enabled).",
+    )
+    parser.add_argument(
+        "--peak-uplift-cap-quantile",
+        type=float,
+        default=0.995,
+        help="Quantile for per-market uplift cap to reduce false extreme spikes.",
+    )
+    parser.add_argument(
         "--save-models",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1244,6 +1503,14 @@ def main() -> None:
             target_transform=args.target_transform,
             use_side_size_modeling=args.use_side_size_modeling,
             side_size_min_rows=args.side_size_min_rows,
+            use_peak_head=args.use_peak_head,
+            peak_label_quantile=args.peak_label_quantile,
+            peak_hour_min_rows=args.peak_hour_min_rows,
+            peak_min_rows=args.peak_min_rows,
+            peak_gate_threshold=args.peak_gate_threshold,
+            peak_blend_mode=args.peak_blend_mode,
+            peak_uplift_positive_only=args.peak_uplift_positive_only,
+            peak_uplift_cap_quantile=args.peak_uplift_cap_quantile,
         )
 
     train_feat, test_feat = build_feature_table(
@@ -1277,6 +1544,14 @@ def main() -> None:
         target_transform=args.target_transform,
         use_side_size_modeling=args.use_side_size_modeling,
         side_size_min_rows=args.side_size_min_rows,
+        use_peak_head=args.use_peak_head,
+        peak_label_quantile=args.peak_label_quantile,
+        peak_hour_min_rows=args.peak_hour_min_rows,
+        peak_min_rows=args.peak_min_rows,
+        peak_gate_threshold=args.peak_gate_threshold,
+        peak_blend_mode=args.peak_blend_mode,
+        peak_uplift_positive_only=args.peak_uplift_positive_only,
+        peak_uplift_cap_quantile=args.peak_uplift_cap_quantile,
     )
 
     # Add global prediction feature to test and run local market experts.
@@ -1333,6 +1608,20 @@ def main() -> None:
         print(f"Side models trained: {len(artifacts.local_side_models)}")
         print(f"Positive-size models trained: {len(artifacts.local_pos_size_models)}")
         print(f"Negative-size models trained: {len(artifacts.local_neg_size_models)}")
+    print(f"Peak head enabled: {artifacts.use_peak_head}")
+    if artifacts.use_peak_head:
+        print(
+            "Peak head settings: "
+            f"q={artifacts.peak_label_quantile}, "
+            f"hour_min_rows={artifacts.peak_hour_min_rows}, "
+            f"peak_min_rows={artifacts.peak_min_rows}, "
+            f"gate_tau={artifacts.peak_gate_threshold}, "
+            f"blend={artifacts.peak_blend_mode}, "
+            f"uplift_positive_only={artifacts.peak_uplift_positive_only}, "
+            f"uplift_cap_q={artifacts.peak_uplift_cap_quantile}"
+        )
+        print(f"Peak gate models trained: {len(artifacts.local_peak_gate_models)}")
+        print(f"Peak uplift models trained: {len(artifacts.local_peak_uplift_models)}")
     print(f"Target transform: {artifacts.target_transform_state.to_metadata()}")
     print(f"CV RMSE: {cv_rmse}")
     if not cv_details.empty:
@@ -1379,12 +1668,29 @@ def main() -> None:
             model.save_model(local_path)
             local_neg_size_model_paths[str(market)] = str(local_path.name)
 
+        local_peak_gate_model_paths: dict[str, str] = {}
+        for market, model in artifacts.local_peak_gate_models.items():
+            safe_market = str(market).replace(" ", "_")
+            local_path = models_dir / f"local_peak_gate_model_{safe_market}.cbm"
+            model.save_model(local_path)
+            local_peak_gate_model_paths[str(market)] = str(local_path.name)
+
+        local_peak_uplift_model_paths: dict[str, str] = {}
+        for market, model in artifacts.local_peak_uplift_models.items():
+            safe_market = str(market).replace(" ", "_")
+            local_path = models_dir / f"local_peak_uplift_model_{safe_market}.cbm"
+            model.save_model(local_path)
+            local_peak_uplift_model_paths[str(market)] = str(local_path.name)
+
         model_meta = {
             "global_model": str(global_model_path.name),
             "local_models": local_model_paths,
             "local_side_models": local_side_model_paths,
             "local_pos_size_models": local_pos_size_model_paths,
             "local_neg_size_models": local_neg_size_model_paths,
+            "local_peak_gate_models": local_peak_gate_model_paths,
+            "local_peak_uplift_models": local_peak_uplift_model_paths,
+            "local_peak_uplift_caps": artifacts.local_peak_uplift_caps,
             "feature_cols": artifacts.feature_cols,
             "cat_cols": artifacts.cat_cols,
             "local_target_is_residual": artifacts.local_target_is_residual,
@@ -1392,6 +1698,16 @@ def main() -> None:
             "side_size_config": {
                 "use_side_size_modeling": artifacts.use_side_size_modeling,
                 "side_size_min_rows": artifacts.side_size_min_rows,
+            },
+            "peak_head_config": {
+                "use_peak_head": artifacts.use_peak_head,
+                "peak_label_quantile": artifacts.peak_label_quantile,
+                "peak_hour_min_rows": artifacts.peak_hour_min_rows,
+                "peak_min_rows": artifacts.peak_min_rows,
+                "peak_gate_threshold": artifacts.peak_gate_threshold,
+                "peak_blend_mode": artifacts.peak_blend_mode,
+                "peak_uplift_positive_only": artifacts.peak_uplift_positive_only,
+                "peak_uplift_cap_quantile": artifacts.peak_uplift_cap_quantile,
             },
             "target_transform": artifacts.target_transform_state.to_metadata(),
             "candidate_features_before_global_pred": candidate_features,
@@ -1404,10 +1720,10 @@ def main() -> None:
         print(f"Saved model metadata: {model_meta_path}")
 
         if args.save_shap:
-            if artifacts.use_side_size_modeling:
+            if artifacts.use_side_size_modeling or artifacts.use_peak_head:
                 print(
                     "Note: SHAP export uses saved normal experts for local attributions; "
-                    "side/size decomposition is not decomposed in the SHAP output."
+                    "side/size and peak-head decomposition are not decomposed in the SHAP output."
                 )
             shap_cmd = [
                 Path(__file__).with_name("shap_from_saved_models.py").as_posix(),

@@ -814,6 +814,18 @@ def run_time_series_cv(
     include_global_pred_in_local: bool,
     loss_function: str,
     target_transform: str,
+    global_iterations: int,
+    global_learning_rate: float,
+    global_depth: int,
+    global_l2_leaf_reg: float,
+    global_bagging_temperature: float,
+    global_random_strength: float,
+    local_iterations: int,
+    local_learning_rate: float,
+    local_depth: int,
+    local_l2_leaf_reg: float,
+    local_bagging_temperature: float,
+    local_random_strength: float,
     use_side_size_modeling: bool,
     side_size_min_rows: int,
     use_peak_head: bool,
@@ -888,6 +900,18 @@ def run_time_series_cv(
             include_global_pred_in_local=include_global_pred_in_local,
             loss_function=loss_function,
             target_transform=target_transform,
+            global_iterations=global_iterations,
+            global_learning_rate=global_learning_rate,
+            global_depth=global_depth,
+            global_l2_leaf_reg=global_l2_leaf_reg,
+            global_bagging_temperature=global_bagging_temperature,
+            global_random_strength=global_random_strength,
+            local_iterations=local_iterations,
+            local_learning_rate=local_learning_rate,
+            local_depth=local_depth,
+            local_l2_leaf_reg=local_l2_leaf_reg,
+            local_bagging_temperature=local_bagging_temperature,
+            local_random_strength=local_random_strength,
             use_side_size_modeling=use_side_size_modeling,
             side_size_min_rows=side_size_min_rows,
             use_peak_head=use_peak_head,
@@ -1002,6 +1026,18 @@ def train_global_and_local_models(
     include_global_pred_in_local: bool,
     loss_function: str = "RMSE",
     target_transform: str = "none",
+    global_iterations: int = 1200,
+    global_learning_rate: float = 0.03,
+    global_depth: int = 6,
+    global_l2_leaf_reg: float = 45.0,
+    global_bagging_temperature: float = 1.0,
+    global_random_strength: float = 1.4,
+    local_iterations: int = 1400,
+    local_learning_rate: float = 0.03,
+    local_depth: int = 6,
+    local_l2_leaf_reg: float = 50.0,
+    local_bagging_temperature: float = 1.0,
+    local_random_strength: float = 1.3,
     use_side_size_modeling: bool = False,
     side_size_min_rows: int = 240,
     use_peak_head: bool = False,
@@ -1036,12 +1072,12 @@ def train_global_and_local_models(
     global_model = CatBoostRegressor(
         loss_function=loss_function,
         eval_metric="RMSE",
-        iterations=1200,
-        learning_rate=0.03,
-        depth=6,
-        l2_leaf_reg=45.0,
-        bagging_temperature=1.0,
-        random_strength=1.4,
+        iterations=global_iterations,
+        learning_rate=global_learning_rate,
+        depth=global_depth,
+        l2_leaf_reg=global_l2_leaf_reg,
+        bagging_temperature=global_bagging_temperature,
+        random_strength=global_random_strength,
         random_seed=42,
         verbose=0,
     )
@@ -1064,12 +1100,12 @@ def train_global_and_local_models(
         normal_model = CatBoostRegressor(
             loss_function=loss_function,
             eval_metric="RMSE",
-            iterations=1400,
-            learning_rate=0.03,
-            depth=6,
-            l2_leaf_reg=50.0,
-            bagging_temperature=1.0,
-            random_strength=1.3,
+            iterations=local_iterations,
+            learning_rate=local_learning_rate,
+            depth=local_depth,
+            l2_leaf_reg=local_l2_leaf_reg,
+            bagging_temperature=local_bagging_temperature,
+            random_strength=local_random_strength,
             random_seed=42,
             verbose=0,
         )
@@ -1388,6 +1424,78 @@ def main() -> None:
         help="Transform target before training and invert predictions before evaluation/submission (default: signed_log).",
     )
     parser.add_argument(
+        "--global-iterations",
+        type=int,
+        default=1200,
+        help="Global model iterations (default: 1200).",
+    )
+    parser.add_argument(
+        "--global-learning-rate",
+        type=float,
+        default=0.03,
+        help="Global model learning rate (default: 0.03).",
+    )
+    parser.add_argument(
+        "--global-depth",
+        type=int,
+        default=6,
+        help="Global model tree depth (default: 6).",
+    )
+    parser.add_argument(
+        "--global-l2-leaf-reg",
+        type=float,
+        default=45.0,
+        help="Global model L2 leaf regularization (default: 45.0).",
+    )
+    parser.add_argument(
+        "--global-bagging-temperature",
+        type=float,
+        default=1.0,
+        help="Global model bagging temperature (default: 1.0).",
+    )
+    parser.add_argument(
+        "--global-random-strength",
+        type=float,
+        default=1.4,
+        help="Global model random strength (default: 1.4).",
+    )
+    parser.add_argument(
+        "--local-iterations",
+        type=int,
+        default=1400,
+        help="Local model iterations (default: 1400).",
+    )
+    parser.add_argument(
+        "--local-learning-rate",
+        type=float,
+        default=0.03,
+        help="Local model learning rate (default: 0.03).",
+    )
+    parser.add_argument(
+        "--local-depth",
+        type=int,
+        default=6,
+        help="Local model tree depth (default: 6).",
+    )
+    parser.add_argument(
+        "--local-l2-leaf-reg",
+        type=float,
+        default=50.0,
+        help="Local model L2 leaf regularization (default: 50.0).",
+    )
+    parser.add_argument(
+        "--local-bagging-temperature",
+        type=float,
+        default=1.0,
+        help="Local model bagging temperature (default: 1.0).",
+    )
+    parser.add_argument(
+        "--local-random-strength",
+        type=float,
+        default=1.3,
+        help="Local model random strength (default: 1.3).",
+    )
+    parser.add_argument(
         "--use-side-size-modeling",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1448,6 +1556,11 @@ def main() -> None:
         help="Quantile for per-market uplift cap to reduce false extreme spikes.",
     )
     parser.add_argument(
+        "--recover-base-2c02eb6",
+        action="store_true",
+        help="Force legacy baseline behavior matching commit 2c02eb6 as closely as possible.",
+    )
+    parser.add_argument(
         "--save-models",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1472,6 +1585,32 @@ def main() -> None:
         help="Sample size per market for local SHAP outputs (default: 400).",
     )
     args = parser.parse_args()
+    if args.recover_base_2c02eb6:
+        args.use_dynamic_target_profiles = False
+        args.use_temporal_regime = False
+        args.use_volatility_regime = False
+        args.use_wind_proxy = False
+        args.use_anomaly_features = False
+        args.use_cross_market_rank_features = False
+        args.use_peak_interactions = False
+        args.local_residual_modeling = False
+        args.include_global_pred_in_local = True
+        args.target_transform = "none"
+        args.use_side_size_modeling = False
+        args.use_peak_head = False
+        args.global_iterations = 2500
+        args.global_learning_rate = 0.03
+        args.global_depth = 8
+        args.global_l2_leaf_reg = 18.0
+        args.global_bagging_temperature = 0.5
+        args.global_random_strength = 1.0
+        args.local_iterations = 3000
+        args.local_learning_rate = 0.025
+        args.local_depth = 8
+        args.local_l2_leaf_reg = 20.0
+        args.local_bagging_temperature = 0.4
+        args.local_random_strength = 0.9
+        print("Applied legacy recovery preset: 2c02eb6")
 
     train_df = pd.read_csv(args.train_path)
     test_df = pd.read_csv(args.test_path)
@@ -1501,6 +1640,18 @@ def main() -> None:
             include_global_pred_in_local=args.include_global_pred_in_local,
             loss_function=args.loss_function,
             target_transform=args.target_transform,
+            global_iterations=args.global_iterations,
+            global_learning_rate=args.global_learning_rate,
+            global_depth=args.global_depth,
+            global_l2_leaf_reg=args.global_l2_leaf_reg,
+            global_bagging_temperature=args.global_bagging_temperature,
+            global_random_strength=args.global_random_strength,
+            local_iterations=args.local_iterations,
+            local_learning_rate=args.local_learning_rate,
+            local_depth=args.local_depth,
+            local_l2_leaf_reg=args.local_l2_leaf_reg,
+            local_bagging_temperature=args.local_bagging_temperature,
+            local_random_strength=args.local_random_strength,
             use_side_size_modeling=args.use_side_size_modeling,
             side_size_min_rows=args.side_size_min_rows,
             use_peak_head=args.use_peak_head,
@@ -1542,6 +1693,18 @@ def main() -> None:
         include_global_pred_in_local=args.include_global_pred_in_local,
         loss_function=args.loss_function,
         target_transform=args.target_transform,
+        global_iterations=args.global_iterations,
+        global_learning_rate=args.global_learning_rate,
+        global_depth=args.global_depth,
+        global_l2_leaf_reg=args.global_l2_leaf_reg,
+        global_bagging_temperature=args.global_bagging_temperature,
+        global_random_strength=args.global_random_strength,
+        local_iterations=args.local_iterations,
+        local_learning_rate=args.local_learning_rate,
+        local_depth=args.local_depth,
+        local_l2_leaf_reg=args.local_l2_leaf_reg,
+        local_bagging_temperature=args.local_bagging_temperature,
+        local_random_strength=args.local_random_strength,
         use_side_size_modeling=args.use_side_size_modeling,
         side_size_min_rows=args.side_size_min_rows,
         use_peak_head=args.use_peak_head,

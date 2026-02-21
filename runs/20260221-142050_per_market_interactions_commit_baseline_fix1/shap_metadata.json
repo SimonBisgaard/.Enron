@@ -1,0 +1,9 @@
+{
+  "run_dir": "runs/20260221-142050_per_market_interactions_commit_baseline_fix1",
+  "feature_builder": "train_per_market_interactions",
+  "global_sample_size_used": 1500,
+  "per_market_sample_size_requested": 400,
+  "rows_train_after_filter": 132608,
+  "global_feature_count": 167,
+  "local_feature_count": 168
+}

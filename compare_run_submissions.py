@@ -34,6 +34,7 @@ def _to_float(v: object) -> float | None:
 def _load_run(run_dir: Path) -> RunArtifacts:
     run_id = run_dir.name
     metrics_path = run_dir / "metrics.json"
+    cv_results_path = run_dir / "cv_results.csv"
     submission_path = run_dir / "submission.csv"
 
     cv_rmse: float | None = None
@@ -43,6 +44,24 @@ def _load_run(run_dir: Path) -> RunArtifacts:
             metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
             cv_rmse = _to_float(metrics.get("cv_rmse"))
             lb_score = _to_float(metrics.get("lb_score"))
+        except Exception:
+            pass
+    if cv_rmse is None and cv_results_path.exists():
+        try:
+            cv_df = pd.read_csv(cv_results_path)
+            if "rmse" in cv_df.columns:
+                rmse_vals = pd.to_numeric(cv_df["rmse"], errors="coerce")
+                valid = rmse_vals.notna()
+                if valid.any():
+                    if "val_rows" in cv_df.columns:
+                        weights = pd.to_numeric(cv_df["val_rows"], errors="coerce").fillna(0.0)
+                        w_valid = valid & (weights > 0)
+                        if w_valid.any():
+                            cv_rmse = float(np.average(rmse_vals[w_valid].to_numpy(dtype=float), weights=weights[w_valid].to_numpy(dtype=float)))
+                        else:
+                            cv_rmse = float(rmse_vals[valid].mean())
+                    else:
+                        cv_rmse = float(rmse_vals[valid].mean())
         except Exception:
             pass
 
@@ -95,6 +114,35 @@ def _pick_best_cv(runs: list[RunArtifacts], explicit: str | None) -> RunArtifact
     return min(candidates, key=lambda r: float(r.cv_rmse))
 
 
+def _load_submission_file(path: Path) -> pd.DataFrame:
+    sub = pd.read_csv(path)
+    if not {"id", "target"}.issubset(sub.columns):
+        raise ValueError(f"Submission file missing id/target columns: {path}")
+    out = sub[["id", "target"]].copy()
+    out["id"] = pd.to_numeric(out["id"], errors="coerce")
+    out["target"] = pd.to_numeric(out["target"], errors="coerce")
+    out = out.dropna().sort_values("id").reset_index(drop=True)
+    if out.empty:
+        raise ValueError(f"Submission file has no valid numeric rows: {path}")
+    return out
+
+
+def _match_run_from_submission_path(runs: list[RunArtifacts], submission_path: Path) -> RunArtifacts | None:
+    try:
+        ref = submission_path.resolve()
+    except Exception:
+        ref = submission_path
+    for run in runs:
+        candidate = (run.run_dir / "submission.csv")
+        try:
+            cand_resolved = candidate.resolve()
+        except Exception:
+            cand_resolved = candidate
+        if cand_resolved == ref:
+            return run
+    return None
+
+
 def _compare_predictions(best_sub: pd.DataFrame, new_sub: pd.DataFrame) -> dict[str, float]:
     merged = best_sub.merge(new_sub, on="id", how="inner", suffixes=("_best", "_new"))
     if merged.empty:
@@ -141,14 +189,16 @@ def _estimate_public_variance(public_rmse: float, public_n: int) -> dict[str, fl
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compare newest run submission vs best-CV run submission.")
+    parser = argparse.ArgumentParser(
+        description="Compare newest run submission vs an explicit reference submission (or best-CV fallback)."
+    )
     parser.add_argument("--runs-dir", default="runs")
     parser.add_argument("--newest-run-id", default=None)
     parser.add_argument("--best-run-id", default=None)
     parser.add_argument(
         "--best-submission-path",
-        default="submissio.csv",
-        help="Champion submission file to compare against (default: submissio.csv).",
+        default=None,
+        help="Champion submission file to compare against. If omitted, uses best-CV run submission.",
     )
     parser.add_argument("--public-rmse", type=float, default=None, help="If omitted, uses newest lb_score or fallback 25.0")
     parser.add_argument("--public-fraction", type=float, default=0.4)
@@ -166,23 +216,23 @@ def main() -> None:
 
     newest = _pick_newest(runs, args.newest_run_id)
     best = _pick_best_cv(runs, args.best_run_id)
+    reference_run: RunArtifacts = best
 
     if newest.submission is None:
         raise ValueError(f"Newest run has no valid submission.csv: {newest.run_id}")
-    best_submission_ref = Path(args.best_submission_path)
+    best_submission_ref = Path(args.best_submission_path) if args.best_submission_path else None
     best_submission_df: pd.DataFrame | None = None
     best_submission_label: str = best.run_id
 
-    if best_submission_ref.exists():
-        champ = pd.read_csv(best_submission_ref)
-        if {"id", "target"}.issubset(champ.columns):
-            champ = champ[["id", "target"]].copy()
-            champ["id"] = pd.to_numeric(champ["id"], errors="coerce")
-            champ["target"] = pd.to_numeric(champ["target"], errors="coerce")
-            champ = champ.dropna().sort_values("id").reset_index(drop=True)
-            if not champ.empty:
-                best_submission_df = champ
-                best_submission_label = f"file:{best_submission_ref}"
+    if best_submission_ref is not None:
+        if not best_submission_ref.exists():
+            raise FileNotFoundError(f"--best-submission-path not found: {best_submission_ref}")
+        best_submission_df = _load_submission_file(best_submission_ref)
+        best_submission_label = f"file:{best_submission_ref}"
+        matched = _match_run_from_submission_path(runs, best_submission_ref)
+        if matched is not None:
+            reference_run = matched
+            best_submission_label = f"{matched.run_id} ({best_submission_ref})"
 
     if best_submission_df is None:
         if best.submission is None:
@@ -192,8 +242,8 @@ def main() -> None:
     compare = _compare_predictions(best_submission_df, newest.submission)
 
     cv_delta = None
-    if newest.cv_rmse is not None and best.cv_rmse is not None:
-        cv_delta = float(newest.cv_rmse - best.cv_rmse)
+    if newest.cv_rmse is not None and reference_run.cv_rmse is not None:
+        cv_delta = float(newest.cv_rmse - reference_run.cv_rmse)
 
     public_rmse = args.public_rmse
     if public_rmse is None:
@@ -211,6 +261,11 @@ def main() -> None:
             "run_id": best.run_id,
             "cv_rmse": best.cv_rmse,
             "lb_score": best.lb_score,
+        },
+        "reference_run": {
+            "run_id": reference_run.run_id,
+            "cv_rmse": reference_run.cv_rmse,
+            "lb_score": reference_run.lb_score,
         },
         "best_submission_reference": best_submission_label,
         "cv_rmse_delta_new_minus_best": cv_delta,
@@ -232,8 +287,9 @@ def main() -> None:
 
     print(f"Newest run: {newest.run_id} | cv_rmse={newest.cv_rmse} | lb={newest.lb_score}")
     print(f"Best CV run: {best.run_id} | cv_rmse={best.cv_rmse} | lb={best.lb_score}")
+    print(f"Reference run: {reference_run.run_id} | cv_rmse={reference_run.cv_rmse} | lb={reference_run.lb_score}")
     print(f"Best submission reference: {best_submission_label}")
-    print(f"CV delta (new-best): {cv_delta}")
+    print(f"CV delta (new-reference): {cv_delta}")
     print("--- Submission comparison ---")
     for k, v in compare.items():
         print(f"{k}: {v}")

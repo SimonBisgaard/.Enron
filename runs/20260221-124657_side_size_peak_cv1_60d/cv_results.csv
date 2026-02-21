@@ -1,0 +1,2 @@
+fold,val_start,val_end,rmse,train_rows,val_rows,peak_precision_mean,peak_recall_mean
+1,2025-07-02,2025-08-31,100.46193453865156,123824,8640,0.010409479129074943,0.08888888888888889

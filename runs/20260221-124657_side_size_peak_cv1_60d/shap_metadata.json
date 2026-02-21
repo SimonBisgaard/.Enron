@@ -1,0 +1,9 @@
+{
+  "run_dir": "runs/20260221-124657_side_size_peak_cv1_60d",
+  "feature_builder": "train_per_market_interactions_hour_experts",
+  "global_sample_size_used": 1500,
+  "per_market_sample_size_requested": 400,
+  "rows_train_after_filter": 132608,
+  "global_feature_count": 215,
+  "local_feature_count": 215
+}

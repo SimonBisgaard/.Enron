@@ -1,0 +1,12 @@
+{
+  "catboost_version": "1.2.10",
+  "git": {
+    "branch": "main",
+    "commit": "00c23e2cb084c285b800859f752058a88bd8f2f9",
+    "status_short": "M catboost_info/catboost_training.json\n M catboost_info/learn/events.out.tfevents\n M catboost_info/learn_error.tsv\n M catboost_info/time_left.tsv\n M csv/submission_per_market_interactions.csv\n M train_per_market_interactions_2c02eb6.py\n?? runs/20260221-170000_avg/\n?? runs/20260221-172305_per_market_interactions_2c02eb6_oct2023_cv1_14d/\n?? runs/20260221-180306_per_market_interactions_residual_stacking/\n?? runs/20260221-183914_per_market_interactions_2c02eb6_oct2023_cv1_14d_temp_physics/"
+  },
+  "numpy_version": "2.4.2",
+  "pandas_version": "3.0.1",
+  "platform": "macOS-15.7.3-arm64-arm-64bit-Mach-O",
+  "python_version": "3.13.5"
+}

@@ -1,0 +1,8 @@
+{
+  "run_dir": "runs/20260221-183914_per_market_interactions_2c02eb6_oct2023_cv1_14d_temp_physics",
+  "global_sample_size_used": 1500,
+  "per_market_sample_size_requested": 400,
+  "rows_train": 99853,
+  "global_feature_count": 178,
+  "local_feature_count": 179
+}

@@ -1,0 +1,10 @@
+a,b,corr,shap_a,shap_b,prefer_keep
+solar_forecast,solar_forecast_xmk_mean,1.0,0.3188372835196076,1.132494953917541,solar_forecast_xmk_mean
+wind_forecast,wind_forecast_xmk_mean,1.0,0.2374256829529892,0.4233446468840182,wind_forecast_xmk_mean
+load_forecast,load_forecast_xmk_mean,1.0,0.1612004179965342,0.1560426290022934,load_forecast
+is_evening_peak,is_peak_17_20,1.0,0.0340665876716096,0.0382671075447732,is_peak_17_20
+residual_load,residual_load_xmk_mean,1.0,1.1613565815780689,0.9941106339305058,residual_load
+wind_forecast_xmk_diff,wind_forecast_xmk_z,1.0,0.0744834314541004,0.0466317314343019,wind_forecast_xmk_diff
+residual_load_xmk_diff,residual_load_xmk_z,1.0,0.0099356451720955,0.0058614986365244,residual_load_xmk_diff
+load_forecast_xmk_diff,load_forecast_xmk_z,0.999999999999993,0.0287796534804175,0.0017893707268037,load_forecast_xmk_diff
+solar_forecast_xmk_diff,solar_forecast_xmk_z,0.9999999999999863,0.0482539328904256,0.0200134331223589,solar_forecast_xmk_diff

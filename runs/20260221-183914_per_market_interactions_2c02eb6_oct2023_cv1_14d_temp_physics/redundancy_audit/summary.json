@@ -1,0 +1,191 @@
+{
+  "rows_train_feat": 99853,
+  "n_features_total": 178,
+  "n_num_features": 174,
+  "n_cat_features": 4,
+  "n_all_nan_num_cols": 0,
+  "all_nan_num_cols": [],
+  "n_constant_num_cols": 4,
+  "constant_num_cols": [
+    "load_forecast_xmk_std",
+    "wind_forecast_xmk_std",
+    "solar_forecast_xmk_std",
+    "residual_load_xmk_std"
+  ],
+  "n_near_constant_num_cols": 4,
+  "near_constant_num_cols_top": [
+    "load_forecast_xmk_std",
+    "wind_forecast_xmk_std",
+    "solar_forecast_xmk_std",
+    "residual_load_xmk_std"
+  ],
+  "n_exact_duplicate_num_pairs": 4,
+  "exact_duplicate_num_pairs": [
+    [
+      "is_evening_peak",
+      "is_peak_17_20"
+    ],
+    [
+      "load_forecast_xmk_std",
+      "wind_forecast_xmk_std"
+    ],
+    [
+      "load_forecast_xmk_std",
+      "solar_forecast_xmk_std"
+    ],
+    [
+      "load_forecast_xmk_std",
+      "residual_load_xmk_std"
+    ]
+  ],
+  "n_high_corr_pairs_abs_ge_0_995": 9,
+  "high_corr_pairs_top_60": [
+    {
+      "a": "solar_forecast",
+      "b": "solar_forecast_xmk_mean",
+      "corr": 1.0
+    },
+    {
+      "a": "wind_forecast",
+      "b": "wind_forecast_xmk_mean",
+      "corr": 1.0
+    },
+    {
+      "a": "load_forecast",
+      "b": "load_forecast_xmk_mean",
+      "corr": 1.0
+    },
+    {
+      "a": "is_evening_peak",
+      "b": "is_peak_17_20",
+      "corr": 1.0
+    },
+    {
+      "a": "residual_load",
+      "b": "residual_load_xmk_mean",
+      "corr": 1.0
+    },
+    {
+      "a": "wind_forecast_xmk_diff",
+      "b": "wind_forecast_xmk_z",
+      "corr": 1.0
+    },
+    {
+      "a": "residual_load_xmk_diff",
+      "b": "residual_load_xmk_z",
+      "corr": 1.0
+    },
+    {
+      "a": "load_forecast_xmk_diff",
+      "b": "load_forecast_xmk_z",
+      "corr": 0.999999999999993
+    },
+    {
+      "a": "solar_forecast_xmk_diff",
+      "b": "solar_forecast_xmk_z",
+      "corr": 0.9999999999999863
+    }
+  ],
+  "low_global_shap_25": [
+    {
+      "feature": "is_night",
+      "mean_abs_shap": 0.0
+    },
+    {
+      "feature": "load_forecast_xmk_std",
+      "mean_abs_shap": 0.0
+    },
+    {
+      "feature": "is_18_19",
+      "mean_abs_shap": 0.0
+    },
+    {
+      "feature": "is_morning_peak",
+      "mean_abs_shap": 0.0
+    },
+    {
+      "feature": "is_winter",
+      "mean_abs_shap": 0.0
+    },
+    {
+      "feature": "solar_forecast_xmk_std",
+      "mean_abs_shap": 0.0
+    },
+    {
+      "feature": "wind_forecast_xmk_std",
+      "mean_abs_shap": 0.0
+    },
+    {
+      "feature": "residual_load_xmk_std",
+      "mean_abs_shap": 0.0
+    },
+    {
+      "feature": "load_forecast_xmk_z",
+      "mean_abs_shap": 0.0017893707268037
+    },
+    {
+      "feature": "meteo_missing_any",
+      "mean_abs_shap": 0.0023271541610829
+    },
+    {
+      "feature": "meteo_missing_count",
+      "mean_abs_shap": 0.0031825495913372
+    },
+    {
+      "feature": "precipitation_amount_xmk_diff",
+      "mean_abs_shap": 0.0058342107338941
+    },
+    {
+      "feature": "residual_load_xmk_z",
+      "mean_abs_shap": 0.0058614986365244
+    },
+    {
+      "feature": "precipitation_amount_xmk_std",
+      "mean_abs_shap": 0.0059153168593121
+    },
+    {
+      "feature": "temp_extreme_flag",
+      "mean_abs_shap": 0.0062895810666267
+    },
+    {
+      "feature": "is_weekend",
+      "mean_abs_shap": 0.0068895429587061
+    },
+    {
+      "feature": "residual_load_xmk_diff",
+      "mean_abs_shap": 0.0099356451720955
+    },
+    {
+      "feature": "hour_x_market",
+      "mean_abs_shap": 0.010754898791159
+    },
+    {
+      "feature": "precipitation_amount_xmk_z",
+      "mean_abs_shap": 0.012594078348086
+    },
+    {
+      "feature": "solar_forecast_xmk_z",
+      "mean_abs_shap": 0.0200134331223589
+    },
+    {
+      "feature": "cloud_cover_mid",
+      "mean_abs_shap": 0.0217536046673786
+    },
+    {
+      "feature": "precipitation_amount_xmk_mean",
+      "mean_abs_shap": 0.0284108373498541
+    },
+    {
+      "feature": "load_forecast_xmk_diff",
+      "mean_abs_shap": 0.0287796534804175
+    },
+    {
+      "feature": "cloud_cover_high",
+      "mean_abs_shap": 0.0305866165943939
+    },
+    {
+      "feature": "relative_humidity_2m",
+      "mean_abs_shap": 0.0320385180119291
+    }
+  ]
+}

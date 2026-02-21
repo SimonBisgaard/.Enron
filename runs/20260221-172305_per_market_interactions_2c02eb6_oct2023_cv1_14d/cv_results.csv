@@ -1,0 +1,2 @@
+fold,val_start,val_end,rmse,train_rows,val_rows
+1,2025-08-17,2025-08-31,93.27923925981274,97693,2016

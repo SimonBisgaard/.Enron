@@ -118,6 +118,25 @@ DEFAULT_2C02EB6_MODEL_PARAMS: dict[str, dict[str, Any]] = {
     },
 }
 
+TUNED_2C02EB6_TRIAL1_MODEL_PARAM_OVERRIDES: dict[str, dict[str, Any]] = {
+    "global_model": {
+        "iterations": 2700,
+        "learning_rate": 0.071417442434829,
+        "depth": 9,
+        "l2_leaf_reg": 24.03989887352124,
+        "bagging_temperature": 0.3900466011060913,
+        "random_strength": 0.4743868488068863,
+    },
+    "local_model": {
+        "iterations": 1800,
+        "learning_rate": 0.05878494724216357,
+        "depth": 9,
+        "l2_leaf_reg": 39.07535901228298,
+        "bagging_temperature": 0.05146123573950612,
+        "random_strength": 2.427783645188786,
+    },
+}
+
 
 def _to_datetime_col(df: pd.DataFrame, col: str) -> pd.Series:
     out = pd.to_datetime(df[col], errors="coerce")
@@ -1748,6 +1767,14 @@ def main() -> None:
         default=None,
         help="Optional path to write the effective CatBoost params used in the run.",
     )
+    parser.add_argument(
+        "--use-2c02eb6-trial1-hparams",
+        action="store_true",
+        help=(
+            "Apply fixed trial hyperparameters for global/local CatBoost models "
+            "(2c02eb6-compatible). Applied after --params-in."
+        ),
+    )
     parser.add_argument("--exclude-2023", action="store_true")
     parser.add_argument("--exclude-2023-keep-from-month", type=int, default=10)
     parser.add_argument(
@@ -1908,6 +1935,10 @@ def main() -> None:
         else int(args.cv_min_train_days)
     )
     model_params = load_2c02eb6_model_params(args.params_in)
+    if args.use_2c02eb6_trial1_hparams:
+        for section in ("global_model", "local_model"):
+            model_params[section].update(TUNED_2C02EB6_TRIAL1_MODEL_PARAM_OVERRIDES[section])
+        print("Applied model-param preset: 2c02eb6_trial1_tuned_hparams")
 
     train_df = pd.read_csv(args.train_path)
     test_df = pd.read_csv(args.test_path)

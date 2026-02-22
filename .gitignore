@@ -9,4 +9,11 @@ wheels/
 # Virtual environments
 .venv
 
-/runs/
+
+/runs
+runs/
+
+*.zip
+catboost_info/
+*.zip
+.DS_Store

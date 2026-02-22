@@ -1,4 +1,11 @@
-Train: uv run python train.py --config-name per_market_v1
-Strict official run (must be clean git): uv run python train.py --official-run
-Add LB score later: uv run python helpers/update_lb_score.py --run-id <run_id> --lb-score <score>
-Tag best run commit: uv run python helpers/tag_run.py --run-id <run_id> --tag exp/best-cv-xx --push
+## Final Submission Repro
+
+```bash
+uv sync
+uv run python reproduce_final_submission.py
+```
+
+Output:
+
+- `runs/<timestamp>_final_submission_repro_bundle/submission.csv`
+- `runs/<timestamp>_final_submission_repro_bundle/repro_manifest.json`

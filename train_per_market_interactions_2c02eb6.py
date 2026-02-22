@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import platform
@@ -87,6 +88,34 @@ ROBUST_POSITIVE_FEATURES = {
     "wind_forecast_roll_mean_24",
     "temp_apparent_gap",
     "convective_available_potential_energy",
+}
+
+
+DEFAULT_2C02EB6_MODEL_PARAMS: dict[str, dict[str, Any]] = {
+    "global_model": {
+        "loss_function": "RMSE",
+        "eval_metric": "RMSE",
+        "iterations": 2500,
+        "learning_rate": 0.03,
+        "depth": 8,
+        "l2_leaf_reg": 18.0,
+        "bagging_temperature": 0.5,
+        "random_strength": 1.0,
+        "random_seed": 42,
+        "verbose": 0,
+    },
+    "local_model": {
+        "loss_function": "RMSE",
+        "eval_metric": "RMSE",
+        "iterations": 3000,
+        "learning_rate": 0.025,
+        "depth": 8,
+        "l2_leaf_reg": 20.0,
+        "bagging_temperature": 0.4,
+        "random_strength": 0.9,
+        "random_seed": 42,
+        "verbose": 0,
+    },
 }
 
 
@@ -665,34 +694,188 @@ def _summarize_family_importance(perm_family_rows: pd.DataFrame) -> pd.DataFrame
     return out[out_cols].sort_values("mean_delta", ascending=False).reset_index(drop=True)
 
 
-def _make_global_model() -> CatBoostRegressor:
-    return CatBoostRegressor(
-        loss_function="RMSE",
-        eval_metric="RMSE",
-        iterations=2500,
-        learning_rate=0.03,
-        depth=8,
-        l2_leaf_reg=18.0,
-        bagging_temperature=0.5,
-        random_strength=1.0,
-        random_seed=42,
-        verbose=0,
-    )
+def load_2c02eb6_model_params(params_in: str | None) -> dict[str, dict[str, Any]]:
+    params: dict[str, dict[str, Any]] = copy.deepcopy(DEFAULT_2C02EB6_MODEL_PARAMS)
+    if not params_in:
+        return params
+    path = Path(params_in)
+    if not path.exists():
+        raise FileNotFoundError(f"Hyperparameter JSON file not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Hyperparameter JSON must be a top-level object.")
+    for section in ["global_model", "local_model"]:
+        override = payload.get(section, {})
+        if isinstance(override, dict):
+            params[section].update(override)
+    return params
 
 
-def _make_local_model() -> CatBoostRegressor:
-    return CatBoostRegressor(
-        loss_function="RMSE",
-        eval_metric="RMSE",
-        iterations=3000,
-        learning_rate=0.025,
-        depth=8,
-        l2_leaf_reg=20.0,
-        bagging_temperature=0.4,
-        random_strength=0.9,
-        random_seed=42,
-        verbose=0,
+def _build_tuning_defaults_from_params(model_params: dict[str, dict[str, Any]]) -> dict[str, float]:
+    return {
+        "global_iterations": int(model_params["global_model"]["iterations"]),
+        "global_learning_rate": float(model_params["global_model"]["learning_rate"]),
+        "global_depth": int(model_params["global_model"]["depth"]),
+        "global_l2_leaf_reg": float(model_params["global_model"]["l2_leaf_reg"]),
+        "global_bagging_temperature": float(model_params["global_model"]["bagging_temperature"]),
+        "global_random_strength": float(model_params["global_model"]["random_strength"]),
+        "local_iterations": int(model_params["local_model"]["iterations"]),
+        "local_learning_rate": float(model_params["local_model"]["learning_rate"]),
+        "local_depth": int(model_params["local_model"]["depth"]),
+        "local_l2_leaf_reg": float(model_params["local_model"]["l2_leaf_reg"]),
+        "local_bagging_temperature": float(model_params["local_model"]["bagging_temperature"]),
+        "local_random_strength": float(model_params["local_model"]["random_strength"]),
+    }
+
+
+def _model_params_from_trial(trial: Any, base_model_params: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    params = copy.deepcopy(base_model_params)
+    params["global_model"].update(
+        {
+            "iterations": int(trial.suggest_int("global_iterations", 1400, 5000, step=100)),
+            "learning_rate": float(trial.suggest_float("global_learning_rate", 0.008, 0.08, log=True)),
+            "depth": int(trial.suggest_int("global_depth", 6, 10)),
+            "l2_leaf_reg": float(trial.suggest_float("global_l2_leaf_reg", 4.0, 80.0, log=True)),
+            "bagging_temperature": float(trial.suggest_float("global_bagging_temperature", 0.0, 2.5)),
+            "random_strength": float(trial.suggest_float("global_random_strength", 0.1, 2.5)),
+            "verbose": 0,
+        }
     )
+    params["local_model"].update(
+        {
+            "iterations": int(trial.suggest_int("local_iterations", 1600, 5600, step=100)),
+            "learning_rate": float(trial.suggest_float("local_learning_rate", 0.008, 0.08, log=True)),
+            "depth": int(trial.suggest_int("local_depth", 6, 10)),
+            "l2_leaf_reg": float(trial.suggest_float("local_l2_leaf_reg", 4.0, 100.0, log=True)),
+            "bagging_temperature": float(trial.suggest_float("local_bagging_temperature", 0.0, 2.5)),
+            "random_strength": float(trial.suggest_float("local_random_strength", 0.1, 2.5)),
+            "verbose": 0,
+        }
+    )
+    return params
+
+
+def _make_global_model(model_params: dict[str, Any] | None = None) -> CatBoostRegressor:
+    params = dict(DEFAULT_2C02EB6_MODEL_PARAMS["global_model"])
+    if model_params:
+        params.update(model_params)
+    return CatBoostRegressor(**params)
+
+
+def _make_local_model(model_params: dict[str, Any] | None = None) -> CatBoostRegressor:
+    params = dict(DEFAULT_2C02EB6_MODEL_PARAMS["local_model"])
+    if model_params:
+        params.update(model_params)
+    return CatBoostRegressor(**params)
+
+
+def tune_2c02eb6_model_params(
+    *,
+    train_df: pd.DataFrame,
+    cv_folds: int,
+    cv_val_days: int,
+    cv_step_days: int,
+    cv_min_train_days: int,
+    base_model_params: dict[str, dict[str, Any]],
+    tune_trials: int,
+    tune_timeout_minutes: float,
+    use_residual_stacking: bool,
+    residual_oof_folds: int,
+    residual_oof_val_days: int,
+    residual_oof_step_days: int,
+    residual_oof_min_train_days: int,
+    add_temperature_demand: bool,
+    add_physics_regime: bool,
+    drop_redundant_features: bool,
+    use_permutation_pruned_feature_set: bool,
+    perm_base_seed: int,
+    perm_corr_threshold: float,
+    perm_eval_families: bool,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    try:
+        import optuna
+    except ImportError as exc:
+        raise RuntimeError(
+            "Optuna is required for --tune-hparams. Install it first (for example: `uv add optuna`)."
+        ) from exc
+
+    if tune_trials <= 0:
+        raise ValueError("--tune-trials must be > 0.")
+    if tune_timeout_minutes <= 0.0:
+        raise ValueError("--tune-time-budget-minutes must be > 0.")
+
+    sampler = optuna.samplers.TPESampler(seed=42)
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1)
+    study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
+    study.enqueue_trial(_build_tuning_defaults_from_params(base_model_params))
+
+    trial_logs: list[dict[str, Any]] = []
+
+    def objective(trial: Any) -> float:
+        t0 = time.perf_counter()
+        model_params_trial = _model_params_from_trial(trial, base_model_params)
+        try:
+            cv_rmse, _, _, _ = run_time_series_cv(
+                train_df_raw=train_df,
+                n_folds=cv_folds,
+                val_days=cv_val_days,
+                step_days=cv_step_days,
+                min_train_days=cv_min_train_days,
+                use_residual_stacking=use_residual_stacking,
+                residual_oof_folds=residual_oof_folds,
+                residual_oof_val_days=residual_oof_val_days,
+                residual_oof_step_days=residual_oof_step_days,
+                residual_oof_min_train_days=residual_oof_min_train_days,
+                add_temperature_demand=add_temperature_demand,
+                add_physics_regime=add_physics_regime,
+                drop_redundant_features=drop_redundant_features,
+                use_permutation_pruned_feature_set=use_permutation_pruned_feature_set,
+                permutation_eval_enabled=False,
+                permutation_eval_base_seed=perm_base_seed,
+                permutation_corr_threshold=perm_corr_threshold,
+                permutation_eval_families=perm_eval_families,
+                on_fold_complete=None,
+                model_params=model_params_trial,
+            )
+            score = float(cv_rmse) if cv_rmse is not None and np.isfinite(cv_rmse) else float("inf")
+        except Exception as exc:
+            score = float("inf")
+            trial.set_user_attr("exception", str(exc))
+
+        elapsed_s = float(time.perf_counter() - t0)
+        trial.set_user_attr("elapsed_seconds", elapsed_s)
+        trial_logs.append(
+            {
+                "trial": int(trial.number),
+                "cv_rmse": float(score),
+                "elapsed_seconds": elapsed_s,
+            }
+        )
+        print(f"[TUNE] trial={trial.number} cv_rmse={score:.6f} elapsed={elapsed_s/60.0:.2f}m")
+        return score
+
+    total_timeout_seconds = float(tune_timeout_minutes) * 60.0
+    t_start = time.perf_counter()
+    study.optimize(
+        objective,
+        n_trials=int(tune_trials),
+        timeout=total_timeout_seconds,
+        show_progress_bar=False,
+        gc_after_trial=True,
+    )
+    elapsed_seconds = float(time.perf_counter() - t_start)
+
+    best_model_params = _model_params_from_trial(study.best_trial, base_model_params)
+    report = {
+        "best_value": float(study.best_value),
+        "best_trial_number": int(study.best_trial.number),
+        "best_trial_params": dict(study.best_trial.params),
+        "best_trial_user_attrs": dict(study.best_trial.user_attrs),
+        "n_trials_completed": int(len(study.trials)),
+        "elapsed_seconds": elapsed_seconds,
+        "trials": trial_logs,
+    }
+    return best_model_params, report
 
 
 def maybe_drop_redundant_features(
@@ -908,35 +1091,11 @@ def save_repro_artifacts(
     candidate_features: list[str],
     artifacts: TrainArtifacts,
     model_file_map: dict[str, Any],
+    model_params: dict[str, dict[str, Any]],
 ) -> None:
     train_path = Path(args.train_path)
     test_path = Path(args.test_path)
     sample_path = Path(args.sample_submission)
-
-    model_params = {
-        "global_model": {
-            "loss_function": "RMSE",
-            "eval_metric": "RMSE",
-            "iterations": 2500,
-            "learning_rate": 0.03,
-            "depth": 8,
-            "l2_leaf_reg": 18.0,
-            "bagging_temperature": 0.5,
-            "random_strength": 1.0,
-            "random_seed": 42,
-        },
-        "local_model": {
-            "loss_function": "RMSE",
-            "eval_metric": "RMSE",
-            "iterations": 3000,
-            "learning_rate": 0.025,
-            "depth": 8,
-            "l2_leaf_reg": 20.0,
-            "bagging_temperature": 0.4,
-            "random_strength": 0.9,
-            "random_seed": 42,
-        },
-    }
 
     run_config = {
         "script": Path(__file__).name,
@@ -1077,6 +1236,7 @@ def compute_global_oof_predictions(
     feature_cols: list[str],
     cat_cols: list[str],
     *,
+    global_model_params: dict[str, Any] | None = None,
     n_folds: int,
     val_days: int,
     step_days: int,
@@ -1102,7 +1262,7 @@ def compute_global_oof_predictions(
         if tr.empty or va.empty:
             continue
 
-        model = _make_global_model()
+        model = _make_global_model(global_model_params)
         model.fit(tr[feature_cols], tr["target"], cat_features=cat_cols)
         oof.loc[va.index] = model.predict(va[feature_cols])
     return oof
@@ -1129,7 +1289,9 @@ def run_time_series_cv(
     permutation_corr_threshold: float,
     permutation_eval_families: bool,
     on_fold_complete: Callable[[int, int], None] | None = None,
+    model_params: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[float | None, pd.DataFrame, pd.DataFrame, PermutationEvalOutputs | None]:
+    model_params = copy.deepcopy(model_params) if model_params is not None else copy.deepcopy(DEFAULT_2C02EB6_MODEL_PARAMS)
     folds = make_time_series_folds(
         train_df=train_df_raw,
         n_folds=n_folds,
@@ -1209,6 +1371,7 @@ def run_time_series_cv(
             tr_feat,
             feat_cols,
             cat_cols,
+            model_params=model_params,
             use_residual_stacking=use_residual_stacking,
             residual_oof_folds=residual_oof_folds,
             residual_oof_val_days=residual_oof_val_days,
@@ -1487,13 +1650,15 @@ def train_global_and_local_models(
     feature_cols: list[str],
     cat_cols: list[str],
     *,
+    model_params: dict[str, dict[str, Any]] | None = None,
     use_residual_stacking: bool,
     residual_oof_folds: int,
     residual_oof_val_days: int,
     residual_oof_step_days: int,
     residual_oof_min_train_days: int,
 ) -> TrainArtifacts:
-    global_model = _make_global_model()
+    model_params = copy.deepcopy(model_params) if model_params is not None else copy.deepcopy(DEFAULT_2C02EB6_MODEL_PARAMS)
+    global_model = _make_global_model(model_params.get("global_model"))
     global_model.fit(train_df[feature_cols], train_df["target"], cat_features=cat_cols)
     train_df = train_df.copy()
     train_df["global_pred_feature"] = global_model.predict(train_df[feature_cols])
@@ -1504,6 +1669,7 @@ def train_global_and_local_models(
             train_df,
             feature_cols,
             cat_cols,
+            global_model_params=model_params.get("global_model"),
             n_folds=residual_oof_folds,
             val_days=residual_oof_val_days,
             step_days=residual_oof_step_days,
@@ -1520,7 +1686,7 @@ def train_global_and_local_models(
 
     local_models: dict[str, CatBoostRegressor] = {}
     for market, mdf in train_df.groupby("market", dropna=False):
-        model = _make_local_model()
+        model = _make_local_model(model_params.get("local_model"))
         local_target = (
             mdf["target"] - mdf["global_pred_oof_feature"]
             if use_residual_stacking
@@ -1572,6 +1738,16 @@ def main() -> None:
     parser.add_argument("--sample-submission", default="data/sample_submission.csv")
     parser.add_argument("--out-dir", default="runs")
     parser.add_argument("--name", default="per_market_interactions")
+    parser.add_argument(
+        "--params-in",
+        default=None,
+        help="Optional JSON overrides for global/local CatBoost params.",
+    )
+    parser.add_argument(
+        "--params-out",
+        default=None,
+        help="Optional path to write the effective CatBoost params used in the run.",
+    )
     parser.add_argument("--exclude-2023", action="store_true")
     parser.add_argument("--exclude-2023-keep-from-month", type=int, default=10)
     parser.add_argument(
@@ -1613,6 +1789,18 @@ def main() -> None:
     parser.add_argument("--cv-val-days", type=int, default=14)
     parser.add_argument("--cv-step-days", type=int, default=14)
     parser.add_argument("--cv-min-train-days", type=int, default=90)
+    parser.add_argument(
+        "--tune-hparams",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable Optuna tuning for 2c02eb6 global/local CatBoost params before main training.",
+    )
+    parser.add_argument("--tune-trials", type=int, default=30)
+    parser.add_argument("--tune-time-budget-minutes", type=float, default=120.0)
+    parser.add_argument("--tune-cv-folds", type=int, default=None)
+    parser.add_argument("--tune-cv-val-days", type=int, default=None)
+    parser.add_argument("--tune-cv-step-days", type=int, default=None)
+    parser.add_argument("--tune-cv-min-train-days", type=int, default=None)
     parser.add_argument(
         "--save-permutation-eval",
         action=argparse.BooleanOptionalAction,
@@ -1706,6 +1894,20 @@ def main() -> None:
     args = parser.parse_args()
     if not (0.0 <= args.perm_corr_threshold <= 1.0):
         raise ValueError("--perm-corr-threshold must be between 0 and 1.")
+    if args.tune_trials <= 0:
+        raise ValueError("--tune-trials must be > 0.")
+    if args.tune_time_budget_minutes <= 0.0:
+        raise ValueError("--tune-time-budget-minutes must be > 0.")
+
+    tune_cv_folds = int(args.tune_cv_folds) if args.tune_cv_folds is not None else int(args.cv_folds)
+    tune_cv_val_days = int(args.tune_cv_val_days) if args.tune_cv_val_days is not None else int(args.cv_val_days)
+    tune_cv_step_days = int(args.tune_cv_step_days) if args.tune_cv_step_days is not None else int(args.cv_step_days)
+    tune_cv_min_train_days = (
+        int(args.tune_cv_min_train_days)
+        if args.tune_cv_min_train_days is not None
+        else int(args.cv_min_train_days)
+    )
+    model_params = load_2c02eb6_model_params(args.params_in)
 
     train_df = pd.read_csv(args.train_path)
     test_df = pd.read_csv(args.test_path)
@@ -1730,6 +1932,7 @@ def main() -> None:
     overall_total_steps = (
         4  # data prepared + main feature table + main training + submission write
         + cv_fold_count
+        + int(args.tune_hparams)
         + int(args.save_models)
         + int(args.save_repro_artifacts)
         + int(args.save_shap)
@@ -1748,6 +1951,42 @@ def main() -> None:
         overall_progress.update(overall_done, force=True)
 
     _overall_tick("data loaded and filters applied")
+
+    tuning_report: dict[str, Any] | None = None
+    if args.tune_hparams:
+        print(
+            "Tuning 2c02eb6 CatBoost params: "
+            f"trials={args.tune_trials}, time_budget_min={args.tune_time_budget_minutes}, "
+            f"cv={tune_cv_folds}x{tune_cv_val_days}d"
+        )
+        model_params, tuning_report = tune_2c02eb6_model_params(
+            train_df=train_df,
+            cv_folds=tune_cv_folds,
+            cv_val_days=tune_cv_val_days,
+            cv_step_days=tune_cv_step_days,
+            cv_min_train_days=tune_cv_min_train_days,
+            base_model_params=model_params,
+            tune_trials=args.tune_trials,
+            tune_timeout_minutes=args.tune_time_budget_minutes,
+            use_residual_stacking=args.use_residual_stacking,
+            residual_oof_folds=args.residual_oof_folds,
+            residual_oof_val_days=args.residual_oof_val_days,
+            residual_oof_step_days=args.residual_oof_step_days,
+            residual_oof_min_train_days=args.residual_oof_min_train_days,
+            add_temperature_demand=args.add_temperature_demand_features,
+            add_physics_regime=args.add_physics_regime_features,
+            drop_redundant_features=args.drop_redundant_features,
+            use_permutation_pruned_feature_set=args.use_permutation_pruned_feature_set,
+            perm_base_seed=args.perm_base_seed,
+            perm_corr_threshold=args.perm_corr_threshold,
+            perm_eval_families=args.perm_eval_families,
+        )
+        print(
+            "Tuning complete: "
+            f"best_cv_rmse={tuning_report['best_value']:.6f} "
+            f"best_trial={tuning_report['best_trial_number']}"
+        )
+        _overall_tick("hyperparameter tuning complete")
 
     cv_rmse = None
     cv_details = pd.DataFrame()
@@ -1777,6 +2016,7 @@ def main() -> None:
             permutation_corr_threshold=args.perm_corr_threshold,
             permutation_eval_families=args.perm_eval_families,
             on_fold_complete=_on_cv_fold_complete,
+            model_params=model_params,
         )
 
     train_feat, test_feat = build_feature_table(
@@ -1816,6 +2056,7 @@ def main() -> None:
         train_feat,
         candidate_features,
         cat_cols,
+        model_params=model_params,
         use_residual_stacking=args.use_residual_stacking,
         residual_oof_folds=args.residual_oof_folds,
         residual_oof_val_days=args.residual_oof_val_days,
@@ -1868,6 +2109,26 @@ def main() -> None:
     print(f"Markets modeled: {sorted(artifacts.local_models.keys())}")
     print(f"Local target is residual: {artifacts.local_target_is_residual}")
     print(f"CV RMSE: {cv_rmse}")
+    if tuning_report is not None:
+        print(
+            f"Tuning best CV RMSE: {tuning_report['best_value']:.6f} "
+            f"(trial {tuning_report['best_trial_number']})"
+        )
+    model_params_path = run_dir / "model_params.json"
+    model_params_path.write_text(json.dumps(model_params, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"Saved effective model params: {model_params_path}")
+    if args.params_out:
+        Path(args.params_out).write_text(json.dumps(model_params, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"Saved params-out copy: {args.params_out}")
+    if tuning_report is not None:
+        tuning_json_path = run_dir / "hparam_tuning.json"
+        tuning_csv_path = run_dir / "hparam_tuning_trials.csv"
+        tuning_json_path.write_text(json.dumps(tuning_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        if tuning_report.get("trials"):
+            pd.DataFrame(tuning_report["trials"]).to_csv(tuning_csv_path, index=False)
+        print(f"Saved tuning report: {tuning_json_path}")
+        if tuning_report.get("trials"):
+            print(f"Saved tuning trials: {tuning_csv_path}")
     if not cv_details.empty:
         cv_path = run_dir / "cv_results.csv"
         cv_details.to_csv(cv_path, index=False)
@@ -1924,6 +2185,7 @@ def main() -> None:
             candidate_features=candidate_features,
             artifacts=artifacts,
             model_file_map=model_file_map,
+            model_params=model_params,
         )
         _overall_tick("repro artifacts saved")
 

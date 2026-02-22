@@ -2,7 +2,7 @@
 
 ```bash
 uv sync
-uv run python reproduce_final_submission.py
+uv run python reproduce_final_submission.py --weights 0.35,0.20,0.25,0.10,0.10
 ```
 
 Output:
